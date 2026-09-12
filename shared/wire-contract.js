@@ -139,10 +139,22 @@ export const CLOUD_EVENTS = {
  */
 
 /**
+ * NOTE (added 2026-09-12, task 5): live prod rows show real drift here —
+ * different game-creation paths over the site's history wrote different
+ * settings shapes (e.g. one older path used periodCount/hasShotClock/
+ * shotClockSec/timeoutsPerHalf/periodDurationMin instead). This typedef is
+ * NOT a claim that every historical row matches it — it's the shape THIS
+ * codebase (box-pi) always writes and always reads back, which is all that
+ * matters for its own resume-from-cloud path (it only ever resumes a game
+ * it created itself). shotClockDuration was missing from the original
+ * version of this typedef and had to be added — without it there was no
+ * way to recover the configured shot-clock length on a cloud-fallback
+ * resume.
  * @typedef {Object} GamesDataSettings
  * @property {'quick'|'stats'|'advanced'} gameMode
  * @property {number} periods
  * @property {number} periodDuration
+ * @property {number} shotClockDuration
  */
 
 // ─────────────────────────────────────────────────────────────────────────

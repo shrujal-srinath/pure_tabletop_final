@@ -10,4 +10,4 @@ Thumbs.db
 
 # runtime journal/snapshot data (daemon/journal.js) — not source
 /data/
-/data-test/
+/data-test*/
