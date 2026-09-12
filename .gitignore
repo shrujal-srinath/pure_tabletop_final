@@ -7,3 +7,7 @@ node_modules/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# runtime journal/snapshot data (daemon/journal.js) — not source
+/data/
+/data-test/
