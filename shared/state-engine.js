@@ -366,7 +366,12 @@ export function reduce(state, action) {
                         : state.clock.shotMs,
                 },
                 lastError: null,
-                _previousState: snapshotForUndo(state),
+                // Deliberately NOT snapshotForUndo(state) — ticks are automatic,
+                // not human-triggered, so they must not create an UNDO point.
+                // Carry the existing snapshot forward so UNDO still reverts to
+                // the last real ref action, not to a fraction-of-a-second-ago
+                // tick. (Review fix, task 3.)
+                _previousState: state._previousState,
             };
         }
 

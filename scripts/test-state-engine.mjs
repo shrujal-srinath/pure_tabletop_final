@@ -62,17 +62,21 @@ state = step('TIMEOUT #3 — REJECTED, none left in this bracket', state, {
     type: ACTIONS.TIMEOUT, payload: { team: 'A' },
 });
 
+const beforeClockStart = state;
 state = step('CLOCK_START', state, { type: ACTIONS.CLOCK_START });
 
-state = step('CLOCK_TICK (12s off the game + shot clock)', state, {
-    type: ACTIONS.CLOCK_TICK, payload: { deltaMs: 12000 },
-});
+// Several ticks in a row — none of these should create their own UNDO
+// point (review fix: ticks are automatic, not human-triggered).
+state = step('CLOCK_TICK #1 (5s)', state, { type: ACTIONS.CLOCK_TICK, payload: { deltaMs: 5000 } });
+state = step('CLOCK_TICK #2 (5s)', state, { type: ACTIONS.CLOCK_TICK, payload: { deltaMs: 5000 } });
+state = step('CLOCK_TICK #3 (2s)', state, { type: ACTIONS.CLOCK_TICK, payload: { deltaMs: 2000 } });
 
 const beforeUndo = state;
-state = step('UNDO (should revert only the CLOCK_TICK)', state, { type: ACTIONS.UNDO });
+state = step('UNDO (should skip all 3 ticks and revert CLOCK_START itself)', state, { type: ACTIONS.UNDO });
 
 console.log('\n─── UNDO check ───');
-console.log('gameMs before UNDO:', beforeUndo.clock.gameMs, '(after the 12s tick)');
-console.log('gameMs after UNDO: ', state.clock.gameMs, '(back to pre-tick, clock still running)');
+console.log('isRunning before UNDO:', beforeUndo.clock.isRunning, '| gameMs:', beforeUndo.clock.gameMs, '(after CLOCK_START + 12s of ticks)');
+console.log('isRunning after UNDO: ', state.clock.isRunning, '| gameMs:', state.clock.gameMs, '(back to before CLOCK_START — ticks left no UNDO point of their own)');
+console.log('matches pre-CLOCK_START state:', state.clock.isRunning === beforeClockStart.clock.isRunning && state.clock.gameMs === beforeClockStart.clock.gameMs);
 
 state = step('UNDO again — single-level, should no-op (no redo)', state, { type: ACTIONS.UNDO });
