@@ -152,10 +152,18 @@ function dispatch(action) {
 
     io.emit(LAN_EVENTS.STATE_UPDATE, currentState);
 
-    // Only broadcast score_pending when this dispatch is what CREATED the
-    // pending attribution — not on every later action while it's still
-    // sitting there unresolved (that would re-trigger the UI's popup).
-    const justBecamePending = !previousState.pendingAttribution && newState.pendingAttribution;
+    // Broadcast score_pending exactly when THIS dispatch's own SCORE action
+    // needed attribution — gated on action.type, not on a null->non-null
+    // diff against previousState. The diff version missed a real case: the
+    // reducer never clears pendingAttribution on its own (a popup timeout is
+    // a UI-local dismissal only — see LiveGame.tsx), so if a team scores
+    // again before an earlier attribution was ever resolved,
+    // previousState.pendingAttribution is already truthy and a null->non-null
+    // diff never fires, silently dropping the second score's popup even
+    // though the reducer correctly recorded a fresh pendingAttribution.
+    // Found by exercising box-pi/ui's real Task 6b verification (timeout,
+    // then score again), not a hypothetical.
+    const justBecamePending = action.type === ACTIONS.SCORE && Boolean(newState.pendingAttribution);
     if (justBecamePending) {
         io.emit(LAN_EVENTS.SCORE_PENDING, {
             team: newState.pendingAttribution.team,

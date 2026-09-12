@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# scripts/verify-*.mjs run output — screenshots, not source
+*-e2e-shots/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
