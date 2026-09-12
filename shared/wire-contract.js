@@ -170,6 +170,7 @@ export const LAN_EVENTS = {
     SCORE_PENDING: 'score_pending',
     UNDO_TRIGGERED: 'undo_triggered',
     PICO_STATUS: 'pico_status',
+    TOUCH_LOCK_STATUS: 'touch_lock_status', // added task 6a — touch-lock is daemon-local state, not part of state-engine's State, so it needed its own event rather than riding inside STATE_UPDATE
     GAME_READY: 'game_ready',
     GAME_ENDED: 'game_ended',
     SETUP_ERROR: 'setup_error',
@@ -224,6 +225,15 @@ export const LAN_EVENTS = {
  * @typedef {Object} PicoStatusPayload
  * @property {boolean} connected
  * @property {string|null} source
+ */
+
+/**
+ * daemon → UI, on `touch_lock_status` — added task 6a. Fired whenever the
+ * physical settings toggle (or a UI-initiated unlock) changes touch-lock
+ * state. Never bundled into StateUpdatePayload: touch-lock isn't game state,
+ * it's a UI-input gate the daemon orchestrator owns separately.
+ * @typedef {Object} TouchLockStatusPayload
+ * @property {boolean} unlocked
  */
 
 /**
