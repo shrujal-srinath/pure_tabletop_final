@@ -16,22 +16,34 @@
 //      closed de facto vocabulary the website/app actually filter box
 //      scores and play-by-play by (GameActionType in shotTypes.ts):
 //      rebound/steal/turnover/block/assist/foul/timeout/substitution/
-//      jumpball/foul_drawn. Of state-engine's own action types, only FOUL
-//      and TIMEOUT map onto a real value in that vocabulary — writing
-//      'SETUP_GAME', 'CLOCK_START', 'UNDO', etc. into this shared,
-//      cross-app-read column would inject garbage into every game's
-//      play-by-play. So this module writes game_actions rows for FOUL and
-//      TIMEOUT only, not "every action" literally. (rebound/steal/
-//      turnover/block/assist/substitution aren't modeled by state-engine
-//      yet at all — a real gap, not silently papered over here.)
+//      jumpball/foul_drawn — there is deliberately NO 'score' word in it.
+//      Confirmed against src/services/statsEngine.ts's own header comment:
+//      "all basketball scoring (incl. free throws) flows through
+//      shot_events" — shot_events, not game_actions, is the canonical
+//      scoring record for BOTH stats and advanced mode (unlocated when no
+//      x/y is known; that's what "unlocated" zone/null x/y exist for).
+//      That's why writeShotEvent below is gated on gameMode !== 'quick',
+//      not === 'advanced' — a quick-mode game correctly has NO play-by-play
+//      at all beyond the games.data snapshot, matching this ecosystem's
+//      own documented mode semantics (CLAUDE.md: "quick — score only. No
+//      player tracking, no stats export."), not an oversight. Of
+//      state-engine's own action types, only FOUL and TIMEOUT map onto a
+//      real game_actions value — writing 'SETUP_GAME', 'CLOCK_START',
+//      'UNDO', etc. into this shared, cross-app-read column would inject
+//      garbage into every game's play-by-play. (rebound/steal/turnover/
+//      block/assist/substitution aren't modeled by state-engine yet at
+//      all — a real gap, not silently papered over here.)
 //   2. shot_events.client_event_id exists but has NO unique constraint
-//      backing it (checked pg_constraint directly) — so it cannot provide
-//      real dedup/idempotency yet. This module does NOT populate it or
-//      pretend retries are exactly-once: a retried write after an
-//      ambiguous network failure (request landed, response lost) could in
-//      rare cases produce a duplicate row. Fixing that for real needs a
-//      migration adding a unique constraint on client_event_id plus using
-//      it here — out of this task's scope, flagged rather than faked.
+//      backing it (checked pg_constraint directly), so a DB-level
+//      ON CONFLICT DO NOTHING isn't available and adding the constraint is
+//      a schema migration out of this repo's scope. insertShotEventIdempotent
+//      below is the application-level guard instead: check-then-insert on
+//      (game_code, client_event_id) before writing, so a write retried
+//      after an ambiguous network failure (request landed, response lost)
+//      can't create a duplicate row. Not as airtight as a DB constraint — a
+//      second process racing the identical check-then-insert could still
+//      slip through — but this daemon is single-process/single-court, so
+//      that race isn't a real exposure here.
 //
 // The games.data JSONB written here is deliberately just wire-contract.js's
 // documented GamesDataRow shape (teamA/teamB/gameState/settings) — the real
@@ -143,8 +155,9 @@ function buildGamesDataRow(state) {
  * @param {Object} opts
  * @param {import('@supabase/supabase-js').SupabaseClient} opts.supabaseClient A single privileged (service-role) client — used for both the realtime channel and durable table writes. The daemon runs server-side, so there's no browser-key constraint requiring two separate clients the way the website needed.
  * @param {string} opts.gameCode Assumed already valid/decided — generating a fresh unique code is separate daemon glue not built here (mirrors the old createGame()'s uniqueness-checked random-code step).
+ * @param {number} [opts.retryIntervalMs] Override for the failed-write retry cadence — defaults to 15s in production; exposed mainly so tests don't have to wait 15 real seconds to observe a retry.
  */
-export function createCloudSync({ supabaseClient, gameCode }) {
+export function createCloudSync({ supabaseClient, gameCode, retryIntervalMs = RETRY_INTERVAL_MS }) {
     let channel = null;
     let lastScoreSnapshot = null; // last broadcast score_update fields (sans ts), for diffing
     let lastTickFlushAt = 0; // shared throttle gate for clock_tick broadcast AND the games.data persist on ticks
@@ -195,7 +208,7 @@ export function createCloudSync({ supabaseClient, gameCode }) {
                 }
             }
             writeQueue = remaining;
-        }, RETRY_INTERVAL_MS);
+        }, retryIntervalMs);
     }
 
     /** Never throws — failures are queued for retry, never crash the daemon or silently vanish. */
@@ -214,7 +227,41 @@ export function createCloudSync({ supabaseClient, gameCode }) {
         if (error) throw new Error(error.message);
     }
 
+    /**
+     * shot_events.client_event_id has NO unique constraint backing it (see
+     * file header) — a DB-level ON CONFLICT DO NOTHING isn't possible, and
+     * adding the constraint is a schema migration out of this repo's scope.
+     * This is the application-level guard instead: before inserting, check
+     * whether a row with this game_code + client_event_id already exists,
+     * and skip if so. It closes the real risk this module's own retry queue
+     * creates (an insert whose request landed but whose response was lost
+     * gets retried, which without this check would insert twice) — not as
+     * strong as a DB constraint (a second daemon process racing the exact
+     * same check-then-insert could still slip through), but this daemon is
+     * single-process/single-court, so that race isn't a real exposure here.
+     */
+    async function insertShotEventIdempotent(row) {
+        const { data: existing, error: selectError } = await supabaseClient
+            .from('shot_events')
+            .select('id')
+            .eq('game_code', row.game_code)
+            .eq('client_event_id', row.client_event_id)
+            .maybeSingle();
+        if (selectError) throw new Error(selectError.message);
+        if (existing) {
+            console.log(`[cloud-sync] shot_events already recorded (client_event_id=${row.client_event_id}) — skipping duplicate insert`);
+            return;
+        }
+        const { error } = await supabaseClient.from('shot_events').insert(row);
+        if (error) throw new Error(error.message);
+    }
+
     function writeShotEvent({ team, points, playerId, x = null, y = null, zone = 'unlocated', attributes = [] }, newState) {
+        // Generated once per logical write, here — NOT inside the retry
+        // closure — so every retry of THIS write reuses the same id and the
+        // guard above actually recognizes it as "already tried this one",
+        // rather than minting a fresh id (and defeating the guard) each retry.
+        const clientEventId = crypto.randomUUID();
         const row = {
             game_code: gameCode,
             player_id: playerId ?? null,
@@ -228,8 +275,9 @@ export function createCloudSync({ supabaseClient, gameCode }) {
             shot_clock_sec: Math.ceil(newState.clock.shotMs / 1000),
             attributes,
             input_method: 'live',
+            client_event_id: clientEventId,
         };
-        writeWithRetry(`shot_events ${team}+${points}`, () => insertRow('shot_events', row));
+        writeWithRetry(`shot_events ${team}+${points}`, () => insertShotEventIdempotent(row));
     }
 
     function writeGameAction({ team, actionType, playerId = null }, newState) {
