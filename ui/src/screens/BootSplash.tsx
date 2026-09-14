@@ -18,18 +18,44 @@
 // down as `bootProgress`) drives the same single `e` (0-1) scalar the
 // source's own paint() already used to drive the arc/comet/segments/hub —
 // this reuses that existing value rather than adding a second, competing
-// one; only WHERE `e` comes from changed (real, smoothed progress instead
-// of a fixed-duration timer). `onReady()` fires — once — when BOTH
-// elapsedMs-since-mount >= MIN_MS and the daemon has actually reported
-// `ready`; App.tsx unmounts this screen and routes to Dashboard in
-// response. If the daemon is ready before MIN_MS has passed, the bar
-// simply holds (the interpolation catches up to 100% and sits there,
-// same as the source's own dial-complete state) rather than cutting the
-// animation short. If BOOT_PROGRESS goes quiet for a while, a small
-// stall indicator appears — this is a real device that might be waiting
-// on a slow UART connection or a cloud-fallback network hiccup, and a
-// silently frozen bar is a worse experience than an honest "still
-// starting up".
+// one; only WHERE `e` comes from changed. `onReady()` fires — once —
+// when BOTH elapsedMs-since-mount >= MIN_MS and the daemon has actually
+// reported `ready`; App.tsx unmounts this screen and routes to Dashboard
+// in response.
+//
+// Two things worth understanding about the pacing (fixed after an
+// earlier version had a real "sometimes stuck, sometimes instant" bug):
+//   - On a genuine first boot this browser session, the wheel is
+//     deliberately paced (see `loadPaceMs`) to sweep to 100% over
+//     roughly MIN_MS, REGARDLESS of how fast the real daemon reports
+//     stages — a fast local boot can complete all its real stages in
+//     under a second, which would otherwise make the bar snap toward
+//     100% almost instantly, defeating the point of a loading animation.
+//     The pace is still capped FROM ABOVE by the real reported percent —
+//     a genuinely slow boot is never rushed past stages that haven't
+//     actually completed — and floored from below by whatever's already
+//     displayed, so it can only ever move forward, never backward.
+//   - `readyFiredRef` gates BOTH `onReady()` and the loop's own permanent
+//     stop condition (`e >= 0.999 -> toEnd()`). This ordering matters: an
+//     earlier version stopped the animation loop purely on visual percent
+//     reaching ~100%, with no check that real-ready + MIN_MS had actually
+//     been confirmed — if the visual dial reached 100% first (entirely
+//     possible before the pacing fix above), the loop died permanently
+//     with nothing left to ever call `onReady()`, stranding the app on
+//     this screen forever. Now the loop only stops once `onReady()` has
+//     already fired.
+//   - A repeat view within the SAME browser session (Return-to-Dashboard,
+//     Start New Game — box-pi navigates via full page reloads, so this
+//     component genuinely remounts each time) skips both the pacing and
+//     the MIN_MS floor via a `sessionStorage` flag set the first time a
+//     real boot sequence completes — see `SPLASH_SEEN_KEY`. It still
+//     waits for a real `ready` (near-instant for an already-running
+//     daemon, via the snapshot-on-connect behavior) rather than assuming.
+//
+// If BOOT_PROGRESS goes quiet for a while, a small stall indicator
+// appears — this is a real device that might be waiting on a slow UART
+// connection or a cloud-fallback network hiccup, and a silently frozen
+// bar is a worse experience than an honest "still starting up".
 //
 // `opId` (top-right "OP_ID" readout, and the QR caption's ?tv= param):
 // the source's own placeholder value, kept as-is. There's no real
@@ -39,14 +65,46 @@
 import { useEffect, useRef } from 'react';
 import type { BootProgressPayload } from '../lib/daemonTypes';
 
-const MIN_MS = 3000;
+// Total mount-to-ready time on a genuine first boot this session: the
+// wheel is deliberately paced to take this long to visually sweep to
+// 100%, and the ready-gate can't open before this either — the two are
+// derived from the SAME constant on purpose so the gate opens right as
+// the sweep finishes, not up to a second early (a real bug in an earlier
+// version of this fix: pacing only the post-PRIME phase to a separate
+// fixed duration while gating readiness off a shorter total made the app
+// able to navigate away before the wheel had visually finished).
+const MIN_MS = 4000;
 const STALL_THRESHOLD_MS = 15000;
-// Time constant for smoothing the displayed percent toward the real
-// target — small enough that the bar is still visibly moving when the
-// next real stage arrives (daemon stages land roughly a second or so
-// apart even on a fast boot), large enough that a 25%-wide jump doesn't
-// look instantaneous.
+// Time constant for smoothing the displayed percent toward the (possibly
+// paced-capped, see LOAD_PACE_MS below) target — small enough that the
+// bar is still visibly moving between paced increments, large enough
+// that a jump doesn't look instantaneous.
 const SMOOTH_TAU_MS = 600;
+// sessionStorage flag: once the splash has genuinely completed a real
+// boot sequence in this browser session, later mounts (Return-to-
+// Dashboard, Start New Game — box-pi navigates via full page reloads,
+// so this component remounts fresh each time) skip both the deliberate
+// pacing and the MIN_MS floor entirely and just track real progress,
+// which for an already-running daemon is ready/100 immediately via the
+// snapshot-on-connect behavior. Session-scoped (not localStorage) on
+// purpose: an actual device/browser restart — the real "cold boot" a
+// kiosk experiences — starts a fresh session and gets the full
+// animation again.
+const SPLASH_SEEN_KEY = 'box-pi-splash-shown';
+function hasShownSplashThisSession(): boolean {
+    try {
+        return sessionStorage.getItem(SPLASH_SEEN_KEY) === '1';
+    } catch {
+        return false; // storage unavailable (e.g. private mode) — default to the full experience, not a skip
+    }
+}
+function markSplashShownThisSession(): void {
+    try {
+        sessionStorage.setItem(SPLASH_SEEN_KEY, '1');
+    } catch {
+        // ignore — not critical if this can't be persisted
+    }
+}
 
 // ── Geometry (unchanged from the source's renderVals()) ─────────────────
 
@@ -228,14 +286,22 @@ export function BootSplash({
         // snapshot of wherever the daemon already is (see daemon/index.js's
         // io.on('connection', ...) — every socket gets the current stage
         // immediately), not a transition from a previously-observed real
-        // stage. Smoothing FROM 0 in that case is wrong: a late joiner
-        // whose first (and only) event is already `ready`/100 must show
-        // 100 immediately, not spend ~3s visually climbing from 0 — smooth
-        // interpolation is for animating BETWEEN two real observed values,
-        // which this isn't yet.
+        // stage — smoothing/pacing FROM 0 in that case would take several
+        // seconds to visually catch up. Snapping straight to it is only
+        // correct on a REPEAT view this session, though (skipMinimum) —
+        // that's the "operator already watched the Pi finish booting a
+        // minute ago, then hit Start New Game" case, and an instant,
+        // accurate readout is exactly right there. On a genuine first
+        // view this session, even if the daemon happens to already be
+        // fully ready by the time this connects, the deliberate pacing in
+        // the animation loop below must still govern the readout — the
+        // whole point of this feature is that the sweep plays out over
+        // roughly MIN_MS regardless of how fast the real backend was.
         if (!hasReceivedFirstProgressRef.current) {
-            displayedPercentRef.current = clamped;
             hasReceivedFirstProgressRef.current = true;
+            if (hasShownSplashThisSession()) {
+                displayedPercentRef.current = clamped;
+            }
         }
     }, [bootProgress]);
 
@@ -248,6 +314,19 @@ export function BootSplash({
             wdirs.push([Math.cos(a), Math.sin(a)]);
         }
         const segLen = ((60 - SEG_GAP) / 360) * 2 * Math.PI * SEG_R;
+
+        // Captured once per mount, not re-checked mid-animation — a flag
+        // flip partway through wouldn't make sense to react to live.
+        const skipMinimum = hasShownSplashThisSession();
+        // On a repeat view this session, don't even make the operator sit
+        // through the fixed spin-up flourish — PRIME becomes a 0ms no-op
+        // and the tick() loop drops straight into real-progress tracking.
+        const effectivePrimeMs = skipMinimum ? 0 : PRIME_MS;
+        // The post-PRIME phase's deliberate visual sweep gets whatever's
+        // left of MIN_MS after PRIME, so the wheel reaches 100% right as
+        // the ready-gate (also MIN_MS from mount) opens — not before it,
+        // not noticeably after it.
+        const loadPaceMs = Math.max(1, MIN_MS - effectivePrimeMs);
 
         let raf = 0;
         let tEnd: number | undefined;
@@ -352,7 +431,7 @@ export function BootSplash({
             snumRefs.current.forEach((t, i) => t.setAttribute('fill', i < si ? '#b4b9c0' : i === si ? '#f5f6f7' : '#7b8189'));
 
             if (captionRef.current) captionRef.current.textContent = priming ? 'CALIBRATING' : 'SYSTEM LOAD';
-            if (metaRef.current) metaRef.current.textContent = priming ? 'SPIN-UP' : `ELAPSED ${((now - t0 - PRIME_MS) / 1000).toFixed(1)}S`;
+            if (metaRef.current) metaRef.current.textContent = priming ? 'SPIN-UP' : `ELAPSED ${((now - t0 - effectivePrimeMs) / 1000).toFixed(1)}S`;
             const trail = trailGroupRef.current;
             if (trail) {
                 trail.setAttribute('transform', `rotate(${rot})`);
@@ -366,8 +445,8 @@ export function BootSplash({
             lastFrameAt = now;
 
             const el = now - t0;
-            if (el < PRIME_MS) {
-                const p = el / PRIME_MS;
+            if (el < effectivePrimeMs) {
+                const p = el / effectivePrimeMs;
                 // accelerating spin-up: ends at roughly the load phase's opening
                 // angular velocity so the hand-over is continuous, not a stall.
                 paint(0, 360 * Math.pow(p, 1.6), true);
@@ -376,18 +455,43 @@ export function BootSplash({
             }
             if (!armed) { armed = true; fireRipple(now); pulseAt = now; }
 
-            // Chase the real target percent rather than a fixed-duration
-            // timer — a 25%-wide stage jump animates smoothly over roughly
-            // SMOOTH_TAU_MS instead of snapping, and the bar simply stops
-            // moving (rather than erroring) once the target stops updating.
+            // The wheel must never look faster than a deliberate ~MIN_MS
+            // sweep on a real, currently-happening boot (real daemon
+            // stages can all land within a second or two on a fast
+            // machine, which would otherwise make the bar snap toward
+            // 100% almost immediately) — but it also must never show MORE
+            // progress than the backend has actually reported (a real
+            // slow boot must still show real, accurate — if halting —
+            // progress, never an artificial cap). `effectiveTarget` is
+            // whichever of those two is LOWER. On a repeat view this
+            // session (skipMinimum), skip the pacing entirely and just
+            // track real progress directly, since the point of that flag
+            // is to land on Dashboard near-instantly, not replay a show.
+            // Floored at the CURRENT displayed value (never the raw target
+            // alone) so this can only ever push progress forward, never
+            // backward — critical for the late-joiner snap in the other
+            // effect below: its first payload can jump displayedPercentRef
+            // straight to 100 with nothing paced yet, and without this
+            // floor the very next tick's low pacedCap would immediately
+            // drag it back down again, fighting that snap.
+            let effectiveTarget = targetPercentRef.current;
+            if (!skipMinimum) {
+                const loadElapsed = el - effectivePrimeMs;
+                const pacedCap = Math.min(1, loadElapsed / loadPaceMs) * 100;
+                effectiveTarget = Math.max(displayedPercentRef.current, Math.min(targetPercentRef.current, pacedCap));
+            }
+
+            // Chase the effective target rather than jumping to it — a
+            // 25%-wide stage jump (or a paced increment) animates smoothly
+            // over roughly SMOOTH_TAU_MS instead of snapping.
             const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
-            displayedPercentRef.current += (targetPercentRef.current - displayedPercentRef.current) * alpha;
+            displayedPercentRef.current += (effectiveTarget - displayedPercentRef.current) * alpha;
             // Pure exponential decay asymptotically approaches the target
             // but mathematically never exactly reaches it — without this,
             // the readout could hover at 99% forever and 'ready' (100)
             // would never actually be reflected on screen. Snap once close.
-            if (Math.abs(targetPercentRef.current - displayedPercentRef.current) < 0.5) {
-                displayedPercentRef.current = targetPercentRef.current;
+            if (Math.abs(effectiveTarget - displayedPercentRef.current) < 0.5) {
+                displayedPercentRef.current = effectiveTarget;
             }
             const e = displayedPercentRef.current / 100;
             paint(e, 360 + e * 720, false);
@@ -397,25 +501,29 @@ export function BootSplash({
                 stallRef.current.style.opacity = stalled ? '1' : '0';
             }
 
-            // Unconditional — the task spec is explicit that this holds
-            // even when boot finishes in under a second (a late-joining
-            // client included): "immediately shows 100%/ready" there means
-            // the BAR value, not a skip of this floor. Known, flagged
-            // tradeoff: box-pi navigates between major screens via full
-            // page loads (window.location.href), so this also means
-            // Return-to-Dashboard/Start-New-Game each re-show a 3s splash
-            // even though the daemon has been running the whole time — the
-            // task asked for an unconditional minimum, so that's what this
-            // implements rather than silently special-casing it away.
-            if (!readyFiredRef.current && stageRef.current === 'ready' && now - mountedAt >= MIN_MS) {
+            // The full MIN_MS floor applies on a genuine first boot this
+            // session (skipMinimum false); a repeat view within the same
+            // session skips it entirely and moves on the instant the
+            // daemon reports ready — which for an already-running daemon
+            // arrives near-instantly via the snapshot-on-connect behavior.
+            const effectiveMinMs = skipMinimum ? 0 : MIN_MS;
+            if (!readyFiredRef.current && stageRef.current === 'ready' && now - mountedAt >= effectiveMinMs) {
                 readyFiredRef.current = true;
+                markSplashShownThisSession();
                 onReadyRef.current?.();
                 // Don't return here — keep animating (holding at/near 100%)
                 // in case the parent hasn't unmounted this component on the
                 // very next tick; better a held frame than a stalled one.
             }
 
-            if (e >= 0.999) { toEnd(); return; }
+            // Only allowed to stop the rAF loop once we've already
+            // confirmed real-ready + the minimum and called onReady() —
+            // this was a real bug: gating purely on the VISUAL percent
+            // reaching ~100% (which, before the pacing fix above, could
+            // happen well before real-ready/MIN_MS on a fast boot) stopped
+            // the loop for good with nothing left to ever call onReady()
+            // again, permanently stranding the app on this screen.
+            if (readyFiredRef.current && e >= 0.999) { toEnd(); return; }
             raf = requestAnimationFrame(tick);
         }
 

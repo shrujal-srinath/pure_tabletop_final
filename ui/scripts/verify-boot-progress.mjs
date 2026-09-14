@@ -6,7 +6,7 @@
 //
 // Four scenarios, matching the task's own verification section:
 //   1. Fresh boot: real stage transitions observed, splash holds for the
-//      full 3s minimum even though a local boot finishes well under that.
+//      full ~4s minimum (MIN_MS) even though a local boot finishes well under that.
 //   2. Slow-boot simulation (BOX_PI_TEST_BOOT_DELAY_MS): splash correctly
 //      shows progress for longer than 3s with no artificial cutoff.
 //   3. Late-joining client: connects after the daemon is already fully
@@ -89,8 +89,8 @@ process.on('exit', () => {
     try { browser.close(); } catch {}
 });
 
-// ═══ Scenario 1: fresh boot, real stages, 3s minimum enforced ═══
-console.log('=== Scenario 1: fresh boot — real stages, splash holds for the 3s minimum ===');
+// ═══ Scenario 1: fresh boot, real stages, MIN_MS minimum enforced ═══
+console.log('=== Scenario 1: fresh boot — real stages, splash holds for the MIN_MS minimum ===');
 {
     const dir = path.join(ROOT, 'data-test-boot-progress-fresh');
     fs.rmSync(dir, { recursive: true, force: true });
@@ -138,7 +138,7 @@ console.log('=== Scenario 1: fresh boot — real stages, splash holds for the 3s
 
     const elapsedToDashboard = dashboardAt - pageOpenedAt;
     console.log(`  elapsed page-open -> Dashboard: ${elapsedToDashboard}ms`);
-    check('splash held for at least the 3000ms minimum even on a fast local boot', elapsedToDashboard >= 3000);
+    check('splash held for at least the ~4000ms MIN_MS floor even on a fast local boot', elapsedToDashboard >= 3500);
 
     probe.close();
     await page.close();
@@ -180,7 +180,7 @@ console.log('=== Scenario 2: slow-boot simulation — progress shown past 3s, no
 
     const elapsedToDashboard = dashboardAt - pageOpenedAt;
     console.log(`  elapsed page-open -> Dashboard: ${elapsedToDashboard}ms (artificial delay was ${ARTIFICIAL_DELAY_MS}ms)`);
-    check('took noticeably longer than the 3s minimum, with no artificial cap', elapsedToDashboard >= ARTIFICIAL_DELAY_MS);
+    check('took noticeably longer than the MIN_MS floor, with no artificial cap', elapsedToDashboard >= ARTIFICIAL_DELAY_MS);
 
     probe.close();
     await page.close();
@@ -190,11 +190,18 @@ console.log('=== Scenario 2: slow-boot simulation — progress shown past 3s, no
 console.log();
 
 // ═══ Scenario 3: late-joining client ═══
-// "Immediately shows 100%/ready" is about the BAR VALUE a late joiner
-// sees (not stuck climbing from 0%) — the 3s minimum display floor is
-// unconditional per the task spec ("holds for the full 3 seconds even if
-// boot finishes in under a second"), so it still applies here too.
-console.log('=== Scenario 3: late-joining client — bar shows ready immediately (still honors the 3s floor) ===');
+// Updated after a follow-up fix (see ui/scripts/verify-boot-pacing.mjs for
+// full coverage of it): a client connecting after the daemon is already
+// fully up still gets exactly one boot_progress event (ready/100, nothing
+// before it) at the DATA level — that part is unchanged and still checked
+// here. But the VISUAL bar no longer snaps straight to 100% for this case
+// the way it originally did: on a genuine first view THIS SESSION (a
+// fresh browser context, as this one is), the deliberate ~MIN_MS pacing
+// now governs the readout regardless of how fast the real backend was —
+// only a REPEAT view within the same session (sessionStorage flag set,
+// exercised in verify-boot-pacing.mjs) snaps instantly. So this scenario
+// now expects the full paced sweep, same as a fresh boot would.
+console.log('=== Scenario 3: late-joining client (fresh session) — data is instant, but the paced sweep still plays out ===');
 {
     const dir = path.join(ROOT, 'data-test-boot-progress-late');
     fs.rmSync(dir, { recursive: true, force: true });
@@ -208,27 +215,23 @@ console.log('=== Scenario 3: late-joining client — bar shows ready immediately
     probe.on('boot_progress', (p) => probeEvents.push(p));
     await new Promise((resolve) => probe.on('connect', resolve));
     await sleep(200);
-    check('a client connecting after boot finished gets ready/100 immediately, with nothing before it', probeEvents.length === 1 && probeEvents[0].stage === 'ready' && probeEvents[0].percent === 100);
+    check('a client connecting after boot finished gets ready/100 immediately at the data level, with nothing before it', probeEvents.length === 1 && probeEvents[0].stage === 'ready' && probeEvents[0].percent === 100);
 
     const pageOpenedAt = Date.now();
-    const page = await browser.newPage({ viewport: { width: 1024, height: 800 } });
+    const context = await browser.newContext(); // fresh sessionStorage, like a true first view
+    const page = await context.newPage({ viewport: { width: 1024, height: 800 } });
     await page.goto('http://localhost:5173/', { waitUntil: 'domcontentloaded' });
-
-    // The bar itself must show 100% quickly — not stuck climbing from 0% —
-    // well before the 3s floor (checked separately below) expires.
-    await page.waitForFunction(() => document.querySelector('[data-testid="boot-pct"]')?.textContent === '100', { timeout: 2000 });
-    console.log('  boot-pct readout reached 100 quickly (not stuck at 0%)');
 
     await page.waitForFunction(() => document.body.textContent?.includes('Start New Game'), { timeout: 10000 });
     const dashboardAt = Date.now();
     await page.screenshot({ path: path.join(SHOT_DIR, '04-late-join-dashboard.png') });
 
     const elapsed = dashboardAt - pageOpenedAt;
-    console.log(`  elapsed page-open -> Dashboard for a late joiner: ${elapsed}ms`);
-    check('late joiner still honors the unconditional 3s floor before navigating (per task spec)', elapsed >= 3000);
+    console.log(`  elapsed page-open -> Dashboard for a late joiner (fresh session): ${elapsed}ms`);
+    check('a first-session view still gets the full deliberate sweep even for an already-ready daemon', elapsed >= 3500);
 
     probe.close();
-    await page.close();
+    await context.close();
     killPort(3001);
     fs.rmSync(dir, { recursive: true, force: true });
 }
