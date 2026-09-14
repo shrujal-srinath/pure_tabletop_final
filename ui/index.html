@@ -5,6 +5,16 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>THE BOX — Pi Console</title>
+    <!-- Used by BootSplash.tsx's ported design (task: Boot/Splash screen).
+         No other screen uses custom fonts yet — this is the repo's first,
+         so index.html's <head> (not a per-component <link>) is where it
+         belongs, same as favicon.svg above. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Archivo:ital,wght@1,800;1,900&display=swap"
+      rel="stylesheet"
+    />
   </head>
   <body>
     <div id="root"></div>
