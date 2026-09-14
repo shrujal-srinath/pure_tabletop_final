@@ -2,13 +2,20 @@ import { useEffect, useState } from 'react';
 import { socket, LAN_EVENTS } from './lib/socket';
 import { BootSplash } from './screens/BootSplash';
 import { LiveGame } from './screens/LiveGame';
+import { Spectator } from './screens/Spectator';
 import type { DaemonState } from './lib/daemonTypes';
 
 // Minimal routing, NOT the real 8-screen router (Dashboard/Match Setup/
 // Roster Setup/Settings/Post-Game are separate later tasks) — just enough
-// to actually reach LiveGame once a game goes active, since a screen with
-// no way to render is a screen that can't be tested against the real
-// daemon. Boot/Splash otherwise.
+// to actually reach LiveGame/Spectator, since a screen with no way to
+// render is a screen that can't be tested against the real daemon.
+//
+// Spectator is reached via a plain URL path (`/spectator`) rather than any
+// in-app navigation — it's meant to be the second physical display's own
+// browser window/tab pointed at a different URL, not something reached by
+// tapping through the referee's screen. Checked ahead of the
+// gameActive/BootSplash branch since the spectator display has no reason
+// to ever show the boot animation or wait on the primary screen's state.
 function App() {
     const [state, setState] = useState<DaemonState | null>(null);
 
@@ -40,6 +47,9 @@ function App() {
         };
     }, []);
 
+    if (window.location.pathname === '/spectator') {
+        return <Spectator />;
+    }
     if (state?.meta.gameActive) {
         return <LiveGame />;
     }

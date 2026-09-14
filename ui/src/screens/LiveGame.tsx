@@ -49,15 +49,10 @@ import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react'
 import { socket, LAN_EVENTS } from '../lib/socket';
 import { ACTIONS, isBonus, isFouledOut } from '../../../shared/state-engine.js';
 import type { DaemonState, Player, ScorePendingPayload, TouchLockStatusPayload, Team } from '../lib/daemonTypes';
+import { ScoreDisplay } from '../components/ScoreDisplay';
+import { ClockDisplay } from '../components/ClockDisplay';
 
 const ATTRIBUTION_TIMEOUT_MS = 8000;
-
-function msToClock(ms: number): string {
-    const totalSec = Math.ceil(ms / 1000);
-    const m = Math.floor(totalSec / 60);
-    const s = totalSec % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
-}
 
 function useCountdown(resetKey: unknown, totalMs: number): number {
     const [secondsLeft, setSecondsLeft] = useState(Math.ceil(totalMs / 1000));
@@ -122,15 +117,10 @@ export function LiveGame() {
 
     return (
         <div style={{ position: 'relative', minHeight: '100vh', background: '#0a0a0a', color: '#fff', fontFamily: 'sans-serif' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-around', padding: 24 }}>
-                <TeamPanel team={teamA} hasBall={possession === 'A'} bonus={isBonus(state, 'A')} />
-                <div style={{ textAlign: 'center' }}>
-                    <div style={{ fontSize: 14, opacity: 0.7, letterSpacing: 2 }}>PERIOD {clock.period}</div>
-                    <div style={{ fontSize: 48, fontFamily: 'monospace' }}>{msToClock(clock.gameMs)}</div>
-                    <div style={{ fontSize: 20, fontFamily: 'monospace', opacity: 0.8 }}>shot {Math.ceil(clock.shotMs / 1000)}</div>
-                    <div style={{ fontSize: 11, opacity: 0.5, marginTop: 4 }}>{meta.gameMode.toUpperCase()} MODE</div>
-                </div>
-                <TeamPanel team={teamB} hasBall={possession === 'B'} bonus={isBonus(state, 'B')} />
+            <div data-testid="scoreboard" style={{ display: 'flex', justifyContent: 'space-around', padding: 24 }}>
+                <ScoreDisplay team={teamA} hasBall={possession === 'A'} bonus={isBonus(state, 'A')} />
+                <ClockDisplay clock={clock} gameMode={meta.gameMode} />
+                <ScoreDisplay team={teamB} hasBall={possession === 'B'} bonus={isBonus(state, 'B')} />
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', padding: '0 24px 24px' }}>
@@ -177,21 +167,6 @@ export function LiveGame() {
 }
 
 // ── Presentational pieces ────────────────────────────────────────────
-
-function TeamPanel({ team, hasBall, bonus }: { team: Team; hasBall: boolean; bonus: boolean }) {
-    return (
-        <div style={{ textAlign: 'center', minWidth: 170 }}>
-            <div style={{ fontSize: 16, textTransform: 'uppercase', letterSpacing: 1 }}>
-                {team.name} {hasBall && <span title="possession">●</span>}
-            </div>
-            <div style={{ fontSize: 64, fontFamily: 'monospace', color: team.color, lineHeight: 1 }}>{team.score}</div>
-            <div style={{ fontSize: 13, marginTop: 4 }}>
-                Fouls: {team.fouls} {bonus && <strong style={{ color: '#ff9500', marginLeft: 6 }}>BONUS</strong>}
-            </div>
-            <div style={{ fontSize: 13 }}>Timeouts: {team.timeouts}</div>
-        </div>
-    );
-}
 
 function TeamControls({ team, onFoul, onTimeout }: { team: Team; onFoul: () => void; onTimeout: () => void }) {
     const timeoutsLeft = team.timeouts > 0;
