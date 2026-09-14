@@ -97,13 +97,39 @@ if (!process.env.SUPABASE_SERVICE_KEY) {
 }
 const supabaseClient = createClient(supabaseUrl, supabaseKey, { auth: { persistSession: false, autoRefreshToken: false } });
 
+// httpServer/io are created BEFORE boot-resume runs (not at their old spot
+// further down) specifically so boot progress can be tracked from the very
+// first real stage — resumeGameState()'s cloud-fallback path can take real
+// network time, and emitBootProgress() needs `io` to exist to broadcast to
+// anyone already connected (nobody can be, this early, but late joiners
+// still need the CURRENT stage handed to them on connect — see
+// io.on('connection', ...) below).
+const httpServer = createServer();
+const io = new Server(httpServer, { cors: { origin: '*' } });
+
+let bootStage = null;
+let bootPercent = 0;
+function emitBootProgress(stage, percent, detail) {
+    bootStage = stage;
+    bootPercent = percent;
+    io.emit(LAN_EVENTS.BOOT_PROGRESS, detail !== undefined ? { stage, percent, detail } : { stage, percent });
+}
+
+// Test-only hook (mirrors BOX_PI_DATA_DIR's existing pattern for isolated
+// test runs) — artificially delays the boot sequence just before the
+// uart-bridge stage, so a verification script can exercise "boot takes
+// longer than Splash's 3s minimum" without a real slow UART/network link.
+const BOOT_DELAY_MS = Number(process.env.BOX_PI_TEST_BOOT_DELAY_MS || 0);
+
 // ── Boot ──────────────────────────────────────────────────────────────
+emitBootProgress('resuming_state', 0);
 const journal = createJournal({ dir: DATA_DIR });
 const breadcrumbGameCode = readGameCodeBreadcrumb();
 
 const resumeResult = await resumeGameState({ journal, supabaseClient, gameCode: breadcrumbGameCode });
 let currentState = resumeResult.state;
 console.log(`[daemon] boot resume source: ${resumeResult.source}`);
+emitBootProgress('starting_server', 25, `resumed from ${resumeResult.source}`);
 
 // Authoritative game-code source going forward is the breadcrumb, not
 // currentState.meta.gameCode — a journal replay runs actions through the
@@ -119,9 +145,6 @@ if (currentState.meta.gameActive && currentGameCode) {
 }
 
 let touchUnlocked = false;
-
-const httpServer = createServer();
-const io = new Server(httpServer, { cors: { origin: '*' } });
 
 // ── The one dispatch path ────────────────────────────────────────────
 function dispatch(action) {
@@ -196,24 +219,11 @@ function setTouchUnlocked(next) {
     console.log(`[daemon] touch ${touchUnlocked ? 'UNLOCKED' : 'LOCKED'}`);
 }
 
-// ── UART bridge (Pico) ───────────────────────────────────────────────
-const uartBridge = createUartBridge({
-    devMode: process.argv.includes('--dev'),
-    onAction: (action) => {
-        // Resolved here, and only here — see file header.
-        if (action.type === 'CLOCK_TOGGLE') {
-            dispatch({ type: currentState.clock.isRunning ? ACTIONS.CLOCK_STOP : ACTIONS.CLOCK_START });
-            return;
-        }
-        if (action.type === 'TOUCH_LOCK_TOGGLE') {
-            setTouchUnlocked(!touchUnlocked);
-            return;
-        }
-        dispatch(action);
-    },
-});
-
 // ── Clock ticker ──────────────────────────────────────────────────────
+// createTicker() only builds the object here — .start() (which is what
+// actually begins ticking) is deferred to the listen() callback below, so
+// its completion can mark the real 'starting_clock' -> 'ready' transition
+// instead of firing before the server (or the uart-bridge) even exists.
 const ticker = createTicker({
     intervalMs: CLOCK_TICK_INTERVAL_MS,
     onTick: (deltaMs) => {
@@ -222,13 +232,16 @@ const ticker = createTicker({
         }
     },
 });
-ticker.start();
 
 // ── Socket.io (the touchscreen UI) ───────────────────────────────────
 io.on('connection', (socket) => {
     console.log(`[daemon] UI connected: ${socket.id}`);
     socket.emit(LAN_EVENTS.STATE_UPDATE, currentState);
     socket.emit(LAN_EVENTS.TOUCH_LOCK_STATUS, { unlocked: touchUnlocked });
+    // Same "hand a late joiner the current snapshot, not just future
+    // broadcasts" pattern as the two lines above — a tab opened after boot
+    // already finished must see `ready`/100 immediately, not a stuck 0%.
+    socket.emit(LAN_EVENTS.BOOT_PROGRESS, { stage: bootStage, percent: bootPercent });
 
     socket.on(LAN_EVENTS.SETUP_GAME, (payload) => {
         try {
@@ -254,8 +267,44 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => console.log(`[daemon] UI disconnected: ${socket.id}`));
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
     console.log(`[daemon] listening on :${PORT} (uart devMode=${process.argv.includes('--dev')})`);
+    emitBootProgress('connecting_uart', 50);
+
+    if (BOOT_DELAY_MS > 0) {
+        console.log(`[daemon] test hook: delaying ${BOOT_DELAY_MS}ms before uart-bridge (BOX_PI_TEST_BOOT_DELAY_MS)`);
+        await new Promise((resolve) => setTimeout(resolve, BOOT_DELAY_MS));
+    }
+
+    // ── UART bridge (Pico) ───────────────────────────────────────────
+    // Created here (not at module scope) so its completion is what the
+    // 'connecting_uart' -> 'starting_clock' transition is actually tied
+    // to, not a timer. Real vs devMode both return synchronously (see
+    // uart-bridge.js's own header) — the real hardware path's actual
+    // serial handshake happens after this call returns, but this module
+    // doesn't currently expose a "port actually opened" promise to wait
+    // on; this stage marks "the bridge is wired up and listening for
+    // input", which is accurate for devMode and the practical signal
+    // available today for real hardware.
+    createUartBridge({
+        devMode: process.argv.includes('--dev'),
+        onAction: (action) => {
+            // Resolved here, and only here — see file header.
+            if (action.type === 'CLOCK_TOGGLE') {
+                dispatch({ type: currentState.clock.isRunning ? ACTIONS.CLOCK_STOP : ACTIONS.CLOCK_START });
+                return;
+            }
+            if (action.type === 'TOUCH_LOCK_TOGGLE') {
+                setTouchUnlocked(!touchUnlocked);
+                return;
+            }
+            dispatch(action);
+        },
+    });
+    emitBootProgress('starting_clock', 75);
+
+    ticker.start();
+    emitBootProgress('ready', 100);
 });
 
 export { dispatch, setTouchUnlocked };

@@ -95,9 +95,17 @@ await page.goto('http://localhost:5173/setup', { waitUntil: 'domcontentloaded' }
 await sleep(300);
 await page.getByLabel('Name').first().fill('Rockets');
 await page.getByLabel('Name').nth(1).fill('Warriors');
-const activePromise = waitForStateActive(true);
 await page.getByRole('button', { name: /Start game/ }).click();
-await activePromise;
+// Wait for the BROWSER's own LiveGame to actually be mounted (scoreboard
+// present) before unlocking — not the admin probe's independent
+// state_update, which can resolve before the browser has additionally
+// received and processed the separately-sent game_ready event. Racing
+// ahead on the admin socket's copy can catch the browser mid-transition
+// (briefly still showing Setup, since App.tsx's LiveGame condition needs
+// both gameActive AND confirmedLive/game_ready) and unlock a screen that
+// hasn't mounted yet — its real mount moments later starts fresh with
+// touchUnlocked back at its default `false`, silently relocking.
+await page.waitForSelector('[data-testid="scoreboard"]', { timeout: 5000 });
 unlockTouch();
 // Wait for the browser's own socket to actually receive touch_lock_status
 // and drop the overlay, rather than a fixed sleep that can race under load.
@@ -164,6 +172,11 @@ console.log();
 // ═══ Scenario 4: Return to Dashboard leads into a genuinely clean new game ═══
 console.log('=== Scenario 4: Return to Dashboard -> clean new game, no leftover state ===');
 await page.getByRole('button', { name: 'Return to Dashboard' }).click();
+// Task 6f made Dashboard the real landing screen — Return to Dashboard
+// navigates to `/` (Dashboard itself), not directly to `/setup` anymore;
+// reaching Match Setup from there is Dashboard's own "Start New Game" button.
+await page.waitForFunction(() => document.body.textContent?.includes('Start New Game'), { timeout: 8000 });
+await page.getByRole('button', { name: /Start New Game/ }).click();
 await page.waitForURL('**/setup', { timeout: 5000 });
 await sleep(300);
 const setupFieldsEmpty = (await page.getByLabel('Name').first().inputValue()) === '';

@@ -6,7 +6,7 @@ import { LiveGame } from './screens/LiveGame';
 import { Spectator } from './screens/Spectator';
 import { Setup } from './screens/Setup';
 import { PostGame } from './screens/PostGame';
-import type { DaemonState } from './lib/daemonTypes';
+import type { BootProgressPayload, DaemonState } from './lib/daemonTypes';
 
 // Minimal routing, NOT the real 8-screen router — just enough to actually
 // reach each screen, since a screen with no way to render is a screen that
@@ -22,12 +22,16 @@ import type { DaemonState } from './lib/daemonTypes';
 //      straight to LiveGame, even if the browser is still sitting on the
 //      /setup URL.
 //   4. /setup reaches the Match Setup -> Roster Setup flow.
-//   5. Once the daemon's first state_update has actually arrived, show
-//      Dashboard — which itself branches on gameActive (task 6f: a daemon
-//      that resumed an already-active game on boot, before this app ever
-//      had a session, must not be silently dropped straight into LiveGame
-//      — see the "confirmedLive" gate below for why that's not step 3).
-//   6. Otherwise (no state_update yet at all) BootSplash.
+//   5. Once BootSplash itself has decided the daemon is genuinely ready
+//      (real BOOT_PROGRESS reaching 'ready', not just the early
+//      state_update every connection gets for free — see `bootReady`'s
+//      own comment below), show Dashboard — which itself branches on
+//      gameActive (task 6f: a daemon that resumed an already-active game
+//      on boot, before this app ever had a session, must not be silently
+//      dropped straight into LiveGame — see the "confirmedLive" gate
+//      below for why that's not step 3).
+//   6. Otherwise, BootSplash — driven by real BOOT_PROGRESS data, not a
+//      fixed timer (task: real boot progress on the Splash screen).
 function App() {
     const [state, setState] = useState<DaemonState | null>(null);
     const [finalState, setFinalState] = useState<DaemonState | null>(null);
@@ -42,6 +46,16 @@ function App() {
     // this gate, Dashboard could never actually render that banner, since
     // gameActive alone would already have routed away from it.
     const [confirmedLive, setConfirmedLive] = useState(false);
+    const [bootProgress, setBootProgress] = useState<BootProgressPayload | null>(null);
+    // Flips true once BootSplash itself decides the daemon is genuinely
+    // ready AND its own minimum-display-time gate is satisfied (see
+    // BootSplash's onReady prop) — only then does Dashboard become
+    // reachable. Deliberately NOT based on `state` truthiness: the daemon
+    // already emits an initial state_update on connect before it has
+    // actually finished starting its uart-bridge/clock (see
+    // daemon/index.js's boot sequence), so `state` alone arrives too early
+    // to mean "safe to show Dashboard and start driving the daemon".
+    const [bootReady, setBootReady] = useState(false);
     // Always holds the latest state_update, read from GAME_ENDED's handler
     // — that handler is registered once (empty deps) so `state` itself
     // would be a stale closure there; a ref sidesteps that.
@@ -66,6 +80,10 @@ function App() {
             setFinalState(null); // a fresh game starting clears any stale post-game snapshot
             setConfirmedLive(true); // this session started it — go straight to LiveGame
         }
+        function onBootProgress(payload: BootProgressPayload) {
+            console.log('[ui] boot_progress:', payload);
+            setBootProgress(payload);
+        }
         function onGameEnded(payload: unknown) {
             console.log('[ui] game_ended:', payload);
             // dispatch() broadcasts the normal STATE_UPDATE (with the frozen
@@ -80,6 +98,7 @@ function App() {
         socket.on('disconnect', onDisconnect);
         socket.on(LAN_EVENTS.STATE_UPDATE, onStateUpdate);
         socket.on(LAN_EVENTS.GAME_READY, onGameReady);
+        socket.on(LAN_EVENTS.BOOT_PROGRESS, onBootProgress);
         socket.on(LAN_EVENTS.GAME_ENDED, onGameEnded);
 
         return () => {
@@ -87,6 +106,7 @@ function App() {
             socket.off('disconnect', onDisconnect);
             socket.off(LAN_EVENTS.STATE_UPDATE, onStateUpdate);
             socket.off(LAN_EVENTS.GAME_READY, onGameReady);
+            socket.off(LAN_EVENTS.BOOT_PROGRESS, onBootProgress);
             socket.off(LAN_EVENTS.GAME_ENDED, onGameEnded);
         };
     }, []);
@@ -114,7 +134,7 @@ function App() {
     if (window.location.pathname === '/setup') {
         return <Setup />;
     }
-    if (state) {
+    if (bootReady && state) {
         return (
             <Dashboard
                 connected={connected}
@@ -126,7 +146,7 @@ function App() {
             />
         );
     }
-    return <BootSplash />;
+    return <BootSplash bootProgress={bootProgress} onReady={() => setBootReady(true)} />;
 }
 
 export default App;

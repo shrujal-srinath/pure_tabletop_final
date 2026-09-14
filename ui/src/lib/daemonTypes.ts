@@ -75,3 +75,11 @@ export interface ScorePendingPayload {
 export interface TouchLockStatusPayload {
     unlocked: boolean;
 }
+
+export type BootStage = 'resuming_state' | 'starting_server' | 'connecting_uart' | 'starting_clock' | 'ready';
+
+export interface BootProgressPayload {
+    stage: BootStage;
+    percent: number;
+    detail?: string;
+}

@@ -171,6 +171,7 @@ export const LAN_EVENTS = {
     UNDO_TRIGGERED: 'undo_triggered',
     PICO_STATUS: 'pico_status',
     TOUCH_LOCK_STATUS: 'touch_lock_status', // added task 6a — touch-lock is daemon-local state, not part of state-engine's State, so it needed its own event rather than riding inside STATE_UPDATE
+    BOOT_PROGRESS: 'boot_progress', // added for Splash's real-progress task — deliberately separate from GAME_READY, which means "a setup_game succeeded", a different real-world moment from "the daemon itself finished booting"
     GAME_READY: 'game_ready',
     GAME_ENDED: 'game_ended',
     SETUP_ERROR: 'setup_error',
@@ -234,6 +235,21 @@ export const LAN_EVENTS = {
  * it's a UI-input gate the daemon orchestrator owns separately.
  * @typedef {Object} TouchLockStatusPayload
  * @property {boolean} unlocked
+ */
+
+/**
+ * daemon → UI, on `boot_progress` — fired at each real stage transition in
+ * the daemon's own startup sequence (resolve boot state -> start the
+ * Socket.io server -> start the uart-bridge -> start the clock ticker),
+ * not on a timer. A client connecting AFTER boot has already finished
+ * receives `ready`/100 immediately on connect, same pattern as
+ * `state_update`/`touch_lock_status` — never leaves a late joiner stuck
+ * with no boot-progress data. `percent` is monotonically increasing
+ * across one boot sequence.
+ * @typedef {Object} BootProgressPayload
+ * @property {'resuming_state'|'starting_server'|'connecting_uart'|'starting_clock'|'ready'} stage
+ * @property {number} percent
+ * @property {string} [detail]
  */
 
 /**
