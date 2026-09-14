@@ -12,45 +12,55 @@
 // through React state/re-render (would cost real perf for zero benefit;
 // the source already avoids this the right way).
 //
-// How this screen ends: real boot progress, not a fake timer. `percent`
-// from `LAN_EVENTS.BOOT_PROGRESS` (App.tsx owns the subscription, same
-// pattern as its other central listeners, and passes the latest payload
-// down as `bootProgress`) drives the same single `e` (0-1) scalar the
-// source's own paint() already used to drive the arc/comet/segments/hub —
-// this reuses that existing value rather than adding a second, competing
-// one; only WHERE `e` comes from changed. `onReady()` fires — once —
-// when BOTH elapsedMs-since-mount >= MIN_MS and the daemon has actually
-// reported `ready`; App.tsx unmounts this screen and routes to Dashboard
-// in response.
+// How this screen ends: real boot progress, not a fake timer — but the
+// ANIMATION itself (PRIME spin-up, then the LOAD-phase sweep) is driven
+// purely by elapsed wall-clock time against fixed durations, exactly like
+// the source. This distinction matters and was the root cause of a real
+// bug in an earlier version of this fix: that version derived `e` by
+// exponentially SMOOTHING toward whatever the real BOOT_PROGRESS percent
+// currently was, which meant `e` (and therefore `spin = 360+e*720`, and
+// therefore every rotating layer) advanced in discrete jumps timed to
+// when each real backend event happened to arrive — visually, the wheel
+// "spun several times separately" instead of turning through one smooth,
+// continuous sweep. The fix: `e` is now the source's own pure time-based
+// formula (`t = loadElapsedMs/LOAD_DURATION_MS` clamped to 1,
+// `e = 1-(1-t)^3`, an ease-out cubic — see `LOAD_DURATION_MS` below),
+// completely decoupled from real backend timing. The real reported
+// percent is used ONLY as a CEILING (`Math.min(pacedE, realCeiling)`) —
+// it can hold the sweep back (a genuinely slow boot never gets rushed
+// past stages that haven't actually completed) but can never make it
+// jump forward faster than the deliberate pace, and — since both the
+// paced curve and the real ceiling are individually monotonically
+// non-decreasing over time — their min is too, so `e` can never regress
+// on its own; no separate floor/clamp needed to guarantee that.
 //
-// Two things worth understanding about the pacing (fixed after an
-// earlier version had a real "sometimes stuck, sometimes instant" bug):
-//   - On a genuine first boot this browser session, the wheel is
-//     deliberately paced (see `loadPaceMs`) to sweep to 100% over
-//     roughly MIN_MS, REGARDLESS of how fast the real daemon reports
-//     stages — a fast local boot can complete all its real stages in
-//     under a second, which would otherwise make the bar snap toward
-//     100% almost instantly, defeating the point of a loading animation.
-//     The pace is still capped FROM ABOVE by the real reported percent —
-//     a genuinely slow boot is never rushed past stages that haven't
-//     actually completed — and floored from below by whatever's already
-//     displayed, so it can only ever move forward, never backward.
-//   - `readyFiredRef` gates BOTH `onReady()` and the loop's own permanent
-//     stop condition (`e >= 0.999 -> toEnd()`). This ordering matters: an
-//     earlier version stopped the animation loop purely on visual percent
-//     reaching ~100%, with no check that real-ready + MIN_MS had actually
-//     been confirmed — if the visual dial reached 100% first (entirely
-//     possible before the pacing fix above), the loop died permanently
-//     with nothing left to ever call `onReady()`, stranding the app on
-//     this screen forever. Now the loop only stops once `onReady()` has
-//     already fired.
-//   - A repeat view within the SAME browser session (Return-to-Dashboard,
-//     Start New Game — box-pi navigates via full page reloads, so this
-//     component genuinely remounts each time) skips both the pacing and
-//     the MIN_MS floor via a `sessionStorage` flag set the first time a
-//     real boot sequence completes — see `SPLASH_SEEN_KEY`. It still
-//     waits for a real `ready` (near-instant for an already-running
-//     daemon, via the snapshot-on-connect behavior) rather than assuming.
+// `onReady()` fires — once — when BOTH elapsedMs-since-mount >= MIN_MS
+// (now `PRIME_MS + LOAD_DURATION_MS`, i.e. the exact total time the
+// animation takes to visually complete — see `MIN_MS`) and the daemon
+// has actually reported `ready`; App.tsx unmounts this screen and routes
+// to Dashboard in response. `readyFiredRef` gates BOTH `onReady()` and
+// the loop's own permanent stop condition (`e >= 0.999 -> toEnd()`) —
+// this ordering matters: an earlier version stopped the animation loop
+// purely on visual percent reaching ~100%, with no check that real-ready
+// + MIN_MS had actually been confirmed — if the visual dial reached 100%
+// first, the loop died permanently with nothing left to ever call
+// `onReady()` again, stranding the app on this screen forever. Now the
+// loop only stops once `onReady()` has already fired.
+//
+// A repeat view within the SAME browser session (Return-to-Dashboard,
+// Start New Game — box-pi navigates via full page reloads, so this
+// component genuinely remounts each time) skips the deliberate pacing
+// and the MIN_MS floor entirely via a `sessionStorage` flag set the
+// first time a real boot sequence completes — see `SPLASH_SEEN_KEY` —
+// and just tracks real progress directly (lightly smoothed, not paced),
+// landing on Dashboard near-instantly since the daemon's been running
+// the whole time. A genuinely NEW session (an actual device/browser
+// restart — the real cold boot a kiosk experiences) always gets the
+// full paced sweep again, even if the daemon happens to already be
+// fully booted by the time the page connects — that's deliberate, not a
+// bug: "even if boot finishes in under a second" the sweep still plays
+// out, which is exactly why the real-percent ceiling above only ever
+// holds the sweep back, never fast-forwards it.
 //
 // If BOOT_PROGRESS goes quiet for a while, a small stall indicator
 // appears — this is a real device that might be waiting on a slow UART
@@ -65,20 +75,32 @@
 import { useEffect, useRef } from 'react';
 import type { BootProgressPayload } from '../lib/daemonTypes';
 
-// Total mount-to-ready time on a genuine first boot this session: the
-// wheel is deliberately paced to take this long to visually sweep to
-// 100%, and the ready-gate can't open before this either — the two are
-// derived from the SAME constant on purpose so the gate opens right as
-// the sweep finishes, not up to a second early (a real bug in an earlier
-// version of this fix: pacing only the post-PRIME phase to a separate
-// fixed duration while gating readiness off a shorter total made the app
-// able to navigate away before the wheel had visually finished).
-const MIN_MS = 4000;
+// PRIME: the fixed local spin-up flourish before any real-progress
+// tracking begins — see the source's own tick(). Unchanged across every
+// fix so far; ground-truth spec confirms 1100ms is correct.
+const PRIME_MS = 1100;
+// LOAD: the deliberate visual sweep's duration, per the ground-truth
+// spec — `t = loadElapsedMs/LOAD_DURATION_MS` clamped to 1,
+// `e = 1-(1-t)^3`. This replaces two earlier guesses (3000, then 4000
+// total) with the actual authoritative number.
+const LOAD_DURATION_MS = 4400;
+// Total mount-to-ready time on a genuine first boot this session —
+// DERIVED from the two constants above (not a separately guessed
+// number) so it can't drift out of sync with what the animation actually
+// takes to visually complete: PRIME_MS to spin up, then LOAD_DURATION_MS
+// for the paced sweep to reach 100%. The ready-gate (`onReady()`) can't
+// open before this total has elapsed, so it opens right as the sweep
+// visually finishes, not before or noticeably after.
+const MIN_MS = PRIME_MS + LOAD_DURATION_MS; // 5500ms
 const STALL_THRESHOLD_MS = 15000;
-// Time constant for smoothing the displayed percent toward the (possibly
-// paced-capped, see LOAD_PACE_MS below) target — small enough that the
-// bar is still visibly moving between paced increments, large enough
-// that a jump doesn't look instantaneous.
+// Time constant for lightly smoothing the displayed percent on a REPEAT
+// session view only (see `skipMinimum` below) — that path tracks real
+// progress directly rather than the deliberate paced sweep, and this
+// just keeps a rare late stage-jump from looking like a hard cut. The
+// paced first-view sweep below does NOT use this — it's driven by the
+// pure `e = 1-(1-t)^3` formula instead, deliberately decoupled from real
+// backend event timing (see the file header for why that distinction
+// is the actual fix here, not a stylistic choice).
 const SMOOTH_TAU_MS = 600;
 // sessionStorage flag: once the splash has genuinely completed a real
 // boot sequence in this browser session, later mounts (Return-to-
@@ -127,7 +149,6 @@ const C_HUB = 2 * Math.PI * HUB_R;
 const WAVE_N = 168;
 const WAVE_BASE = 213;
 const WAVE_AMP = 9.5;
-const PRIME_MS = 1100;
 // The source's STAGES array also carries label/link/subs per stage, but
 // paint() never actually reads them in this version of the design (only
 // STAGES.length, for the 6 arc segments) — kept as a plain count rather
@@ -322,11 +343,6 @@ export function BootSplash({
         // through the fixed spin-up flourish — PRIME becomes a 0ms no-op
         // and the tick() loop drops straight into real-progress tracking.
         const effectivePrimeMs = skipMinimum ? 0 : PRIME_MS;
-        // The post-PRIME phase's deliberate visual sweep gets whatever's
-        // left of MIN_MS after PRIME, so the wheel reaches 100% right as
-        // the ready-gate (also MIN_MS from mount) opens — not before it,
-        // not noticeably after it.
-        const loadPaceMs = Math.max(1, MIN_MS - effectivePrimeMs);
 
         let raf = 0;
         let tEnd: number | undefined;
@@ -455,45 +471,41 @@ export function BootSplash({
             }
             if (!armed) { armed = true; fireRipple(now); pulseAt = now; }
 
-            // The wheel must never look faster than a deliberate ~MIN_MS
-            // sweep on a real, currently-happening boot (real daemon
-            // stages can all land within a second or two on a fast
-            // machine, which would otherwise make the bar snap toward
-            // 100% almost immediately) — but it also must never show MORE
-            // progress than the backend has actually reported (a real
-            // slow boot must still show real, accurate — if halting —
-            // progress, never an artificial cap). `effectiveTarget` is
-            // whichever of those two is LOWER. On a repeat view this
-            // session (skipMinimum), skip the pacing entirely and just
-            // track real progress directly, since the point of that flag
-            // is to land on Dashboard near-instantly, not replay a show.
-            // Floored at the CURRENT displayed value (never the raw target
-            // alone) so this can only ever push progress forward, never
-            // backward — critical for the late-joiner snap in the other
-            // effect below: its first payload can jump displayedPercentRef
-            // straight to 100 with nothing paced yet, and without this
-            // floor the very next tick's low pacedCap would immediately
-            // drag it back down again, fighting that snap.
-            let effectiveTarget = targetPercentRef.current;
-            if (!skipMinimum) {
+            let e: number;
+            if (skipMinimum) {
+                // Repeat view this session — no deliberate pacing, just
+                // lightly-smoothed real progress (the late-joiner snap in
+                // the other effect above already set displayedPercentRef
+                // directly if the first payload was already near-ready;
+                // this only matters for the rare case of a real
+                // in-progress stage change happening during a repeat view).
+                const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
+                displayedPercentRef.current += (targetPercentRef.current - displayedPercentRef.current) * alpha;
+                // Pure exponential decay asymptotically approaches the
+                // target but never exactly reaches it — snap once close so
+                // 'ready' (100) actually gets reflected on screen.
+                if (Math.abs(targetPercentRef.current - displayedPercentRef.current) < 0.5) {
+                    displayedPercentRef.current = targetPercentRef.current;
+                }
+                e = displayedPercentRef.current / 100;
+            } else {
+                // THE fix: e is a pure function of elapsed time (ease-out
+                // cubic, matching the source exactly), never smoothed
+                // toward or chasing the real backend value — that chasing
+                // was the actual bug (see file header). The real reported
+                // percent is used only as a ceiling: it can hold the sweep
+                // back on a genuinely slow boot, never speed it up. Both
+                // pacedE and realCeiling are individually monotonically
+                // non-decreasing over the life of one boot sequence, so
+                // their min is too — e can't regress on its own, no
+                // separate floor needed.
                 const loadElapsed = el - effectivePrimeMs;
-                const pacedCap = Math.min(1, loadElapsed / loadPaceMs) * 100;
-                effectiveTarget = Math.max(displayedPercentRef.current, Math.min(targetPercentRef.current, pacedCap));
+                const t = Math.min(1, loadElapsed / LOAD_DURATION_MS);
+                const pacedE = 1 - Math.pow(1 - t, 3);
+                const realCeiling = targetPercentRef.current / 100;
+                e = Math.min(pacedE, realCeiling);
+                displayedPercentRef.current = e * 100; // kept in sync for any other reader, not used to derive e itself
             }
-
-            // Chase the effective target rather than jumping to it — a
-            // 25%-wide stage jump (or a paced increment) animates smoothly
-            // over roughly SMOOTH_TAU_MS instead of snapping.
-            const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
-            displayedPercentRef.current += (effectiveTarget - displayedPercentRef.current) * alpha;
-            // Pure exponential decay asymptotically approaches the target
-            // but mathematically never exactly reaches it — without this,
-            // the readout could hover at 99% forever and 'ready' (100)
-            // would never actually be reflected on screen. Snap once close.
-            if (Math.abs(effectiveTarget - displayedPercentRef.current) < 0.5) {
-                displayedPercentRef.current = effectiveTarget;
-            }
-            const e = displayedPercentRef.current / 100;
             paint(e, 360 + e * 720, false);
 
             if (stallRef.current) {
