@@ -70,8 +70,20 @@ function useCountdown(resetKey: unknown, totalMs: number): number {
     return secondsLeft;
 }
 
-export function LiveGame() {
-    const [state, setState] = useState<DaemonState | null>(null);
+export function LiveGame({ initialState = null }: { initialState?: DaemonState | null }) {
+    // Starting from `initialState` (App.tsx already has the current state
+    // by the time it decides to mount LiveGame — see App.tsx's central
+    // state_update subscription) rather than always null matters: the
+    // daemon only pushes a fresh state_update on a NEW socket connection or
+    // an actual state change, not on request, and this component reuses
+    // the app-wide already-connected `socket` singleton rather than opening
+    // its own connection. Without this, LiveGame could sit on "waiting for
+    // state" indefinitely after mounting with nothing to trigger a new
+    // broadcast — a real gap only surfaced by Task 6f's resume flow
+    // (Dashboard -> LiveGame with no intervening score/foul/etc. to mask
+    // it), not by earlier tasks, which always exercised a subsequent action
+    // first.
+    const [state, setState] = useState<DaemonState | null>(initialState);
     const [touchUnlocked, setTouchUnlocked] = useState(false);
     const [pending, setPending] = useState<ScorePendingPayload | null>(null);
     const [foulPickerTeam, setFoulPickerTeam] = useState<'A' | 'B' | null>(null);
