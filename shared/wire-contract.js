@@ -175,9 +175,11 @@ export const LAN_EVENTS = {
     GAME_READY: 'game_ready',
     GAME_ENDED: 'game_ended',
     SETUP_ERROR: 'setup_error',
+    BOX_IDENTITY: 'box_identity', // added for the box-identity/online-setup task — sent on every connect, same snapshot-on-connect pattern as state_update/touch_lock_status/boot_progress
+    REMOTE_GAME_AVAILABLE: 'remote_game_available', // added for the box-identity/online-setup task — daemon surfaces a remote box_units assignment, never auto-switches
     // UI → daemon
     SETUP_GAME: 'setup_game',
-    UI_ACTION: 'ui_action',
+    UI_ACTION: 'ui_action', // ACCEPT_REMOTE_GAME (added for the box-identity task) rides this same event, like every other UI-originated action
 };
 
 /**
@@ -253,6 +255,33 @@ export const LAN_EVENTS = {
  */
 
 /**
+ * daemon → UI, on `box_identity` — sent on every connect (same
+ * snapshot-on-connect pattern as state_update/touch_lock_status/
+ * boot_progress). `boxCode` is the Pi's own permanent 4-char device ID
+ * (persisted to disk, see daemon/box-identity.js) — not a per-game code,
+ * used only to build the online-setup QR URL
+ * (theboxbybmsce.in/setup?box={boxCode}) shown on Dashboard.
+ * @typedef {Object} BoxIdentityPayload
+ * @property {string} boxCode
+ */
+
+/**
+ * daemon → UI, on `remote_game_available` — a game was assigned to this
+ * box's `box_units` row remotely (website operator scanned/typed the
+ * Dashboard QR's box code and launched a game there). Never causes an
+ * automatic switch on its own; the UI shows a confirm/dismiss popup and
+ * only sends ACCEPT_REMOTE_GAME if the operator actually picks "Load".
+ * Also sent as a snapshot-on-connect (same pattern as state_update/
+ * boot_progress/box_identity) whenever a still-unresolved assignment is
+ * already pending at connection time — not just on the live signal — so
+ * a page that reloads between the assignment arriving and it being acted
+ * on (routine here, since box-pi navigates via full page reloads) still
+ * sees the popup, not silence.
+ * @typedef {Object} RemoteGameAvailablePayload
+ * @property {string} gameCode
+ */
+
+/**
  * daemon → UI, on `game_ready` — sent once `setup_game` succeeds.
  * @typedef {Object} GameReadyPayload
  * @property {string} gameCode
@@ -295,6 +324,16 @@ export const LAN_EVENTS = {
  * UI → daemon, on `ui_action`. Any touchscreen-originated button press.
  * `type` names the action; the shape of `payload` depends on `type` and is
  * owned by whichever module handles that action, not by this contract.
+ * `type: 'ACCEPT_REMOTE_GAME'` (box-identity task) is one such action —
+ * `payload: { gameCode: string }`, the operator confirming the
+ * REMOTE_GAME_AVAILABLE popup's "Load" button. Not a state-engine ACTIONS
+ * member (it doesn't go through reduce() — see daemon/index.js's
+ * acceptRemoteGame(), which reconstructs state from the cloud row the
+ * same way Task 5's boot-resume cloud-fallback does). `type:
+ * 'DISMISS_REMOTE_GAME'` (same payload shape) is its sibling — the
+ * popup's "Continue manual setup" button — and marks that gameCode
+ * resolved daemon-side so it never re-prompts again this run, including
+ * on a later reconnect.
  * @typedef {Object} UiActionPayload
  * @property {string} type
  * @property {Object} [payload]

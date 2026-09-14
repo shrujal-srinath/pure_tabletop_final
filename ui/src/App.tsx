@@ -6,7 +6,8 @@ import { LiveGame } from './screens/LiveGame';
 import { Spectator } from './screens/Spectator';
 import { Setup } from './screens/Setup';
 import { PostGame } from './screens/PostGame';
-import type { BootProgressPayload, DaemonState } from './lib/daemonTypes';
+import { RemoteGamePopup } from './components/RemoteGamePopup';
+import type { BootProgressPayload, BoxIdentityPayload, DaemonState, RemoteGameAvailablePayload } from './lib/daemonTypes';
 
 // Minimal routing, NOT the real 8-screen router — just enough to actually
 // reach each screen, since a screen with no way to render is a screen that
@@ -56,6 +57,13 @@ function App() {
     // daemon/index.js's boot sequence), so `state` alone arrives too early
     // to mean "safe to show Dashboard and start driving the daemon".
     const [bootReady, setBootReady] = useState(false);
+    // box-identity task: the Pi's own permanent device id (for Dashboard's
+    // setup QR) and any remotely-assigned game the daemon has surfaced but
+    // not yet loaded — the daemon itself already tracks "already
+    // presented" per gameCode, so this just holds whatever the latest
+    // still-open assignment is; App.tsx doesn't need its own dedup.
+    const [boxCode, setBoxCode] = useState<string | null>(null);
+    const [remoteGameCode, setRemoteGameCode] = useState<string | null>(null);
     // Always holds the latest state_update, read from GAME_ENDED's handler
     // — that handler is registered once (empty deps) so `state` itself
     // would be a stale closure there; a ref sidesteps that.
@@ -84,6 +92,14 @@ function App() {
             console.log('[ui] boot_progress:', payload);
             setBootProgress(payload);
         }
+        function onBoxIdentity(payload: BoxIdentityPayload) {
+            console.log('[ui] box_identity:', payload);
+            setBoxCode(payload.boxCode);
+        }
+        function onRemoteGameAvailable(payload: RemoteGameAvailablePayload) {
+            console.log('[ui] remote_game_available:', payload);
+            setRemoteGameCode(payload.gameCode);
+        }
         function onGameEnded(payload: unknown) {
             console.log('[ui] game_ended:', payload);
             // dispatch() broadcasts the normal STATE_UPDATE (with the frozen
@@ -99,6 +115,8 @@ function App() {
         socket.on(LAN_EVENTS.STATE_UPDATE, onStateUpdate);
         socket.on(LAN_EVENTS.GAME_READY, onGameReady);
         socket.on(LAN_EVENTS.BOOT_PROGRESS, onBootProgress);
+        socket.on(LAN_EVENTS.BOX_IDENTITY, onBoxIdentity);
+        socket.on(LAN_EVENTS.REMOTE_GAME_AVAILABLE, onRemoteGameAvailable);
         socket.on(LAN_EVENTS.GAME_ENDED, onGameEnded);
 
         return () => {
@@ -107,6 +125,8 @@ function App() {
             socket.off(LAN_EVENTS.STATE_UPDATE, onStateUpdate);
             socket.off(LAN_EVENTS.GAME_READY, onGameReady);
             socket.off(LAN_EVENTS.BOOT_PROGRESS, onBootProgress);
+            socket.off(LAN_EVENTS.BOX_IDENTITY, onBoxIdentity);
+            socket.off(LAN_EVENTS.REMOTE_GAME_AVAILABLE, onRemoteGameAvailable);
             socket.off(LAN_EVENTS.GAME_ENDED, onGameEnded);
         };
     }, []);
@@ -114,8 +134,19 @@ function App() {
     if (window.location.pathname === '/spectator') {
         return <Spectator />;
     }
+
+    // Everything below this point is a pre-game (or just-ended) screen —
+    // exactly where the box-identity task wants the remote-game popup
+    // reachable from (Dashboard, Match/Roster Setup, and PostGame too,
+    // since a new remote assignment can legitimately arrive right after
+    // the previous game ends). LiveGame is deliberately excluded — the
+    // daemon's own guardrail already refuses to even emit
+    // REMOTE_GAME_AVAILABLE while a game is active, but gating it here
+    // too means a UI-only race can never show this popup on top of a
+    // live game in progress.
+    let mainContent;
     if (finalState) {
-        return (
+        mainContent = (
             <PostGame
                 finalState={finalState}
                 onReturnToDashboard={() => {
@@ -127,26 +158,34 @@ function App() {
                 }}
             />
         );
-    }
-    if (state?.meta.gameActive && confirmedLive) {
-        return <LiveGame initialState={state} />;
-    }
-    if (window.location.pathname === '/setup') {
-        return <Setup />;
-    }
-    if (bootReady && state) {
-        return (
+    } else if (state?.meta.gameActive && confirmedLive) {
+        return <LiveGame initialState={state} />; // early return — no popup on LiveGame, see above
+    } else if (window.location.pathname === '/setup') {
+        mainContent = <Setup />;
+    } else if (bootReady && state) {
+        mainContent = (
             <Dashboard
                 connected={connected}
                 state={state}
+                boxCode={boxCode}
                 onStartMatch={() => {
                     window.location.href = '/setup';
                 }}
                 onResumeGame={() => setConfirmedLive(true)}
             />
         );
+    } else {
+        mainContent = <BootSplash bootProgress={bootProgress} onReady={() => setBootReady(true)} />;
     }
-    return <BootSplash bootProgress={bootProgress} onReady={() => setBootReady(true)} />;
+
+    return (
+        <>
+            {mainContent}
+            {remoteGameCode && (
+                <RemoteGamePopup gameCode={remoteGameCode} onDismiss={() => setRemoteGameCode(null)} />
+            )}
+        </>
+    );
 }
 
 export default App;

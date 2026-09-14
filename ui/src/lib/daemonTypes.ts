@@ -83,3 +83,11 @@ export interface BootProgressPayload {
     percent: number;
     detail?: string;
 }
+
+export interface BoxIdentityPayload {
+    boxCode: string;
+}
+
+export interface RemoteGameAvailablePayload {
+    gameCode: string;
+}

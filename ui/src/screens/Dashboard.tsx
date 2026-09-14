@@ -12,16 +12,28 @@
 //     resume logic). Surfaced as an explicit "resume?" banner, not a
 //     silent auto-jump into LiveGame — see App.tsx's `confirmedLive` gate
 //     for why that distinction matters and how it's enforced.
-//   - otherwise -> the normal start flow, one button into Match Setup.
+//   - otherwise -> the normal start flow: a QR encoding
+//     theboxbybmsce.in/setup?box={boxCode} (online setup — box-identity
+//     task) alongside the existing manual "Start New Game" button,
+//     visually following the Splash end-screen's split-panel layout for
+//     consistency, but functionally and data-wise a completely separate
+//     thing from Splash's own cast-QR (different URL, different table,
+//     different value — `boxCode` here, not Splash's `opId`). No QR is
+//     shown while `boxCode` hasn't arrived yet (BOX_IDENTITY is
+//     snapshot-on-connect, so this is only ever a brief window).
 
 import type { CSSProperties } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import type { DaemonState } from '../lib/daemonTypes';
 
+const SETUP_BASE_URL = 'https://theboxbybmsce.in/setup';
+
 export function Dashboard({
-    connected, state, onStartMatch, onResumeGame,
+    connected, state, boxCode, onStartMatch, onResumeGame,
 }: {
     connected: boolean;
     state: DaemonState;
+    boxCode: string | null;
     onStartMatch: () => void;
     onResumeGame: () => void;
 }) {
@@ -43,7 +55,23 @@ export function Dashboard({
                     </button>
                 </div>
             ) : (
-                <div style={{ marginTop: 24 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 40, marginTop: 24, flexWrap: 'wrap' }}>
+                    {boxCode && (
+                        <>
+                            <div data-testid="online-setup-qr" style={qrPanelStyle}>
+                                <div style={{ fontSize: 10, letterSpacing: '0.2em', color: '#4c86ff', textTransform: 'uppercase', marginBottom: 10 }}>
+                                    Online Setup
+                                </div>
+                                <div style={{ background: '#fff', padding: 10, display: 'inline-block' }}>
+                                    <QRCodeSVG value={`${SETUP_BASE_URL}?box=${boxCode}`} size={128} />
+                                </div>
+                                <div style={{ fontSize: 9, letterSpacing: '0.08em', color: '#6a7078', marginTop: 10 }}>
+                                    theboxbybmsce.in/setup?box=<span style={{ color: '#9aa0a8' }}>{boxCode}</span>
+                                </div>
+                            </div>
+                            <div style={{ fontSize: 11, letterSpacing: '0.2em', color: '#555' }}>OR</div>
+                        </>
+                    )}
                     <button onClick={onStartMatch} style={primaryButtonStyle}>
                         Start New Game →
                     </button>
@@ -57,3 +85,4 @@ const pageStyle: CSSProperties = { padding: 24, color: '#fff', background: '#0a0
 const statusStyle: CSSProperties = { fontSize: 13, marginBottom: 24 };
 const resumeCardStyle: CSSProperties = { background: '#161616', border: '1px solid #444', borderRadius: 10, padding: 24, maxWidth: 420, marginTop: 24 };
 const primaryButtonStyle: CSSProperties = { padding: '12px 20px', fontSize: 15, background: '#222', color: '#fff', border: '1px solid #555', borderRadius: 6, cursor: 'pointer' };
+const qrPanelStyle: CSSProperties = { background: '#161616', border: '1px solid #444', borderRadius: 10, padding: 20, textAlign: 'center' };

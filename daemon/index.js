@@ -55,8 +55,12 @@ import { LAN_EVENTS } from '../shared/wire-contract.js';
 import { createUartBridge } from './uart-bridge.js';
 import { createTicker } from './clock.js';
 import { createJournal } from './journal.js';
-import { createCloudSync } from './cloud-sync.js';
-import { resumeGameState } from './resume.js';
+import { createCloudSync, fetchGameRow } from './cloud-sync.js';
+import { resumeGameState, cloudRowToState } from './resume.js';
+import {
+    getOrCreateBoxCode, registerBoxUnit, startBoxHeartbeat,
+    subscribeBoxUnit, subscribeBoxSignal, markBoxLive, resetBoxUnit,
+} from './box-identity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -65,6 +69,12 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 // directories without touching the real data/ dir.
 const DATA_DIR = process.env.BOX_PI_DATA_DIR || path.join(__dirname, '..', 'data');
 const GAME_CODE_FILE = path.join(DATA_DIR, 'current-game-code.txt');
+
+// Part A (box-identity task) — persisted once, ever; never regenerated on
+// later boots (see box-identity.js's own header for why). Pure local file
+// I/O, no network dependency, so this can happen before the Supabase
+// client below even exists.
+const boxCode = getOrCreateBoxCode(DATA_DIR);
 const PORT = 3001;
 const CLOCK_TICK_INTERVAL_MS = 100;
 
@@ -146,6 +156,127 @@ if (currentState.meta.gameActive && currentGameCode) {
 
 let touchUnlocked = false;
 
+// ── Box identity (online QR setup / remote game assignment) ───────────
+// Tracks gameCodes the operator has already CONSCIOUSLY resolved this run
+// (dismissed via "Continue manual setup", or attempted "Load" whether it
+// succeeded or failed) — daemon-side, in-memory only (per the task's own
+// spec: a restart re-presenting an already-resolved assignment once is an
+// acceptable, rare edge case, not one worth persisting for).
+const presentedGameCodes = new Set();
+// The one still-open assignment, if any — distinct from presentedGameCodes
+// above. box-pi navigates between screens via full page reloads
+// (Return-to-Dashboard, Start New Game), so "a new socket connects while
+// an assignment is still pending" is a routine occurrence here, not a rare
+// edge case — this needs the SAME snapshot-on-connect treatment every
+// other daemon->UI event already gets (state_update, boot_progress,
+// box_identity), or an operator whose screen happens to reload in that
+// window would simply never see the popup at all. Cleared once the
+// operator actually resolves it (DISMISS_REMOTE_GAME or ACCEPT_REMOTE_GAME).
+let pendingRemoteAssignment = null;
+
+function handleRemoteAssignment(gameCode) {
+    if (!gameCode) return;
+    // Guardrail (Part B): a live game is never interrupted by a stray or
+    // duplicate remote assignment — not even surfaced, let alone loaded.
+    if (currentState.meta.gameActive) {
+        console.log(`[box-identity] ignoring remote assignment ${gameCode} — already in an active game`);
+        return;
+    }
+    if (presentedGameCodes.has(gameCode)) return; // already resolved once — don't re-prompt
+    pendingRemoteAssignment = gameCode;
+    console.log(`[box-identity] remote game available: ${gameCode}`);
+    io.emit(LAN_EVENTS.REMOTE_GAME_AVAILABLE, { gameCode });
+}
+function handleRemoteReset() {
+    console.log('[box-identity] remote reset signal received (no local action taken)');
+}
+/** Marks a gameCode as resolved (dismissed, or an attempted Load — success or failure) so it never re-prompts again this run. */
+function resolveRemoteAssignment(gameCode) {
+    presentedGameCodes.add(gameCode);
+    if (pendingRemoteAssignment === gameCode) pendingRemoteAssignment = null;
+}
+
+// box_units, unlike games/game_actions, has RLS open to the anon key for
+// INSERT/UPDATE (registration has to work with no auth session at all —
+// see box-identity.js's header) — meaning, unlike the rest of this
+// file's cloud writes, a registration call here doesn't just get
+// silently rejected under the anon key, it actually succeeds and writes
+// a real row into the LIVE shared box_units table. Every isolated test
+// run (BOX_PI_DATA_DIR set) would otherwise mint and register a fresh
+// junk box code against production on every single invocation — this
+// module is skipped entirely for those, unless a test explicitly opts
+// in via BOX_PI_TEST_ENABLE_BOX_IDENTITY (the one dedicated box-identity
+// verification script that actually needs live behavior sets this).
+const BOX_IDENTITY_ENABLED = !process.env.BOX_PI_DATA_DIR || process.env.BOX_PI_TEST_ENABLE_BOX_IDENTITY === '1';
+
+// Fire-and-forget, deliberately not top-level-awaited: registration is a
+// network call, and nothing about the daemon's own boot sequence (or
+// BOOT_PROGRESS) should ever wait on it or be able to fail because of it.
+(async function initBoxIdentity() {
+    if (!BOX_IDENTITY_ENABLED) {
+        console.log('[box-identity] disabled for this run (BOX_PI_DATA_DIR set, no BOX_PI_TEST_ENABLE_BOX_IDENTITY opt-in) — no live box_units writes');
+        return;
+    }
+    try {
+        const existing = await registerBoxUnit(supabaseClient, boxCode);
+        console.log(`[box-identity] registered as ${boxCode} (existing assignment: ${existing.game_code ?? 'none'}, status: ${existing.status})`);
+        startBoxHeartbeat(supabaseClient, boxCode);
+        subscribeBoxSignal(supabaseClient, boxCode, handleRemoteAssignment, handleRemoteReset);
+        subscribeBoxUnit(supabaseClient, boxCode, handleRemoteAssignment, handleRemoteReset);
+        // A game may already have been remotely assigned before this boot
+        // ever ran (e.g. assigned while the Pi was off) — surface it the
+        // same way a live signal would, subject to the same guardrail.
+        if (existing.game_code && existing.status === 'game_ready') {
+            handleRemoteAssignment(existing.game_code);
+        }
+    } catch (err) {
+        console.error('[box-identity] init failed (Dashboard QR / remote assignment unavailable this run):', err.message);
+    }
+})();
+
+/**
+ * UI → daemon, on ui_action `ACCEPT_REMOTE_GAME`. Reconstructs state from
+ * the remote game's existing cloud row — reuses Task 5's cloud-fallback
+ * logic (resume.js's cloudRowToState/cloud-sync.js's fetchGameRow)
+ * verbatim rather than duplicating it, just triggered on-demand instead
+ * of only at boot. Robustness requirement from the task spec: ANY
+ * failure here (network error, malformed row, anything) must never
+ * block, crash, or interrupt whatever the operator is doing locally —
+ * hence the blanket try/catch with nothing re-thrown.
+ * @param {string} gameCode
+ */
+async function acceptRemoteGame(gameCode) {
+    if (!gameCode) return;
+    if (currentState.meta.gameActive) {
+        console.log('[box-identity] ACCEPT_REMOTE_GAME ignored — a game is already active locally');
+        return;
+    }
+    // Resolved regardless of outcome below — a failed Load shouldn't keep
+    // re-prompting the same broken assignment forever either.
+    resolveRemoteAssignment(gameCode);
+    try {
+        const row = await fetchGameRow(supabaseClient, gameCode);
+        if (!row) {
+            console.warn(`[box-identity] ACCEPT_REMOTE_GAME: no games row found for ${gameCode} — manual setup unaffected`);
+            return;
+        }
+        const state = cloudRowToState(row);
+
+        currentGameCode = gameCode;
+        writeGameCodeBreadcrumb(gameCode);
+        if (cloudSync) cloudSync.disconnect();
+        cloudSync = createCloudSync({ supabaseClient, gameCode });
+        cloudSync.connect();
+        currentState = { ...state, meta: { ...state.meta, gameCode } };
+
+        io.emit(LAN_EVENTS.STATE_UPDATE, currentState);
+        console.log(`[box-identity] accepted remote game ${gameCode} — ${currentState.teamA.name} ${currentState.teamA.score}-${currentState.teamB.score} ${currentState.teamB.name}, period ${currentState.clock.period}`);
+        if (currentState.meta.gameActive && BOX_IDENTITY_ENABLED) markBoxLive(supabaseClient, boxCode).catch((err) => console.error('[box-identity] markBoxLive failed:', err.message));
+    } catch (err) {
+        console.error('[box-identity] ACCEPT_REMOTE_GAME failed (local manual flow unaffected):', err.message);
+    }
+}
+
 // ── The one dispatch path ────────────────────────────────────────────
 function dispatch(action) {
     // Nothing but SETUP_GAME is meaningful before a game exists — mirrors
@@ -167,6 +298,10 @@ function dispatch(action) {
         if (cloudSync) cloudSync.disconnect();
         cloudSync = createCloudSync({ supabaseClient, gameCode: currentGameCode });
         cloudSync.connect();
+        // box-identity lifecycle bookend — every SETUP_GAME necessarily
+        // activates a game (state-engine's SETUP_GAME always does), so this
+        // is unconditional here, unlike acceptRemoteGame's own check.
+        if (BOX_IDENTITY_ENABLED) markBoxLive(supabaseClient, boxCode).catch((err) => console.error('[box-identity] markBoxLive failed:', err.message));
     }
 
     journal.recordAction(action, newState);
@@ -207,6 +342,9 @@ function dispatch(action) {
         writeGameCodeBreadcrumb(null);
         currentGameCode = null;
         io.emit(LAN_EVENTS.GAME_ENDED, { finalCode });
+        // box-identity lifecycle bookend — mirrors the source's own
+        // "Pi resets after game ends" (resetBoxUnit).
+        if (BOX_IDENTITY_ENABLED) resetBoxUnit(supabaseClient, boxCode).catch((err) => console.error('[box-identity] resetBoxUnit failed:', err.message));
     }
 
     return newState;
@@ -242,6 +380,16 @@ io.on('connection', (socket) => {
     // broadcasts" pattern as the two lines above — a tab opened after boot
     // already finished must see `ready`/100 immediately, not a stuck 0%.
     socket.emit(LAN_EVENTS.BOOT_PROGRESS, { stage: bootStage, percent: bootPercent });
+    // Same pattern again — boxCode never changes at runtime, but a late
+    // joiner still needs it handed over on connect, not just derivable
+    // from some future event.
+    socket.emit(LAN_EVENTS.BOX_IDENTITY, { boxCode });
+    // Same pattern once more — a still-open, not-yet-resolved remote
+    // assignment must reach a NEW connection too, not just whichever
+    // socket happened to be connected the instant it was first surfaced
+    // (see pendingRemoteAssignment's own comment for why this genuinely
+    // matters here, unlike in the source this was ported from).
+    if (pendingRemoteAssignment) socket.emit(LAN_EVENTS.REMOTE_GAME_AVAILABLE, { gameCode: pendingRemoteAssignment });
 
     socket.on(LAN_EVENTS.SETUP_GAME, (payload) => {
         try {
@@ -255,6 +403,26 @@ io.on('connection', (socket) => {
     socket.on(LAN_EVENTS.UI_ACTION, (uiAction) => {
         if (uiAction.type === 'UNLOCK_TOUCH') {
             setTouchUnlocked(true);
+            return;
+        }
+        if (uiAction.type === 'ACCEPT_REMOTE_GAME') {
+            // Same tier as SETUP_GAME/UNLOCK_TOUCH — bypasses touchUnlocked
+            // deliberately. This is a pre-game Dashboard action; touch-lock
+            // exists to gate the LIVE GAME screen (the physical settings
+            // toggle), and defaults LOCKED, so gating this the same way
+            // would make the popup's own "Load" button silently do nothing
+            // on real hardware before the operator ever unlocks anything.
+            acceptRemoteGame(uiAction.payload?.gameCode);
+            return;
+        }
+        if (uiAction.type === 'DISMISS_REMOTE_GAME') {
+            // "Continue manual setup" — same tier as ACCEPT_REMOTE_GAME,
+            // same reasoning (pre-game Dashboard action, must work while
+            // touch is locked). Marks it resolved so it never re-prompts,
+            // including on a later reconnect — the explicit
+            // "reconnects/re-renders don't keep re-popping" requirement.
+            const code = uiAction.payload?.gameCode;
+            if (code) resolveRemoteAssignment(code);
             return;
         }
         if (!touchUnlocked) {
