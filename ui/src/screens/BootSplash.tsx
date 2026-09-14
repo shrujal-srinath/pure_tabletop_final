@@ -62,6 +62,25 @@
 // out, which is exactly why the real-percent ceiling above only ever
 // holds the sweep back, never fast-forwards it.
 //
+// One deliberate exception to the session-skip, via `isBrowserReload()`:
+// a manual browser reload (F5/Cmd+R) always gets the full animation too,
+// even within an already-"seen" session — the Navigation Timing API
+// reports `type: 'reload'` only for an actual reload, never for the
+// app's own `window.location.href` navigations, so the two are reliably
+// distinguishable. An operator hitting reload is a deliberate "show me
+// this again" gesture (or troubleshooting), not the same intent as
+// clicking through Return-to-Dashboard mid-session — showing an instant
+// flash there reads as broken, not as the feature working.
+//
+// A separate safety net (`NO_PROGRESS_FALLBACK_MS`) exists for a rare
+// failure mode distinct from "a genuinely slow boot": if NO real
+// BOOT_PROGRESS has arrived at all for several seconds — data loss, not
+// slowness, since a healthy connection reports its first stage within
+// milliseconds — the real-percent ceiling stops holding `e` pinned at 0
+// and opens fully, so the paced sweep can still complete instead of
+// freezing the wheel forever while `ELAPSED` keeps counting up. The
+// stall indicator still separately warns if this is happening.
+//
 // If BOOT_PROGRESS goes quiet for a while, a small stall indicator
 // appears — this is a real device that might be waiting on a slow UART
 // connection or a cloud-fallback network hiccup, and a silently frozen
@@ -93,6 +112,12 @@ const LOAD_DURATION_MS = 4400;
 // visually finishes, not before or noticeably after.
 const MIN_MS = PRIME_MS + LOAD_DURATION_MS; // 5500ms
 const STALL_THRESHOLD_MS = 15000;
+// How long to wait for the FIRST real BOOT_PROGRESS payload before
+// treating its absence as missing data rather than "still coming" — a
+// healthy connection delivers it within milliseconds (see
+// daemon/index.js's snapshot-on-connect), so this is a generous margin,
+// not a tight one.
+const NO_PROGRESS_FALLBACK_MS = 3000;
 // Time constant for lightly smoothing the displayed percent on a REPEAT
 // session view only (see `skipMinimum` below) — that path tracks real
 // progress directly rather than the deliberate paced sweep, and this
@@ -119,6 +144,27 @@ function hasShownSplashThisSession(): boolean {
     } catch {
         return false; // storage unavailable (e.g. private mode) — default to the full experience, not a skip
     }
+}
+// A manual browser reload (F5/Cmd+R) is a real, distinct signal from the
+// app's own internal full-page navigations (Return-to-Dashboard/Start
+// New Game both use window.location.href) — the Navigation Timing API
+// reports `type: 'reload'` ONLY for an actual reload, never for those.
+// An operator hitting reload is a deliberate "look at this again"
+// gesture (or troubleshooting) and should always get the full show,
+// even within the same session — only the app's OWN navigations skip it.
+function isBrowserReload(): boolean {
+    try {
+        const [nav] = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[];
+        return nav?.type === 'reload';
+    } catch {
+        return false;
+    }
+}
+// The single source of truth for "should this mount skip the deliberate
+// pacing/MIN_MS floor" — a repeat view this session, EXCEPT a genuine
+// manual reload, which always gets the full animation regardless.
+function shouldSkipMinimum(): boolean {
+    return hasShownSplashThisSession() && !isBrowserReload();
 }
 function markSplashShownThisSession(): void {
     try {
@@ -320,7 +366,7 @@ export function BootSplash({
         // roughly MIN_MS regardless of how fast the real backend was.
         if (!hasReceivedFirstProgressRef.current) {
             hasReceivedFirstProgressRef.current = true;
-            if (hasShownSplashThisSession()) {
+            if (shouldSkipMinimum()) {
                 displayedPercentRef.current = clamped;
             }
         }
@@ -338,7 +384,7 @@ export function BootSplash({
 
         // Captured once per mount, not re-checked mid-animation — a flag
         // flip partway through wouldn't make sense to react to live.
-        const skipMinimum = hasShownSplashThisSession();
+        const skipMinimum = shouldSkipMinimum();
         // On a repeat view this session, don't even make the operator sit
         // through the fixed spin-up flourish — PRIME becomes a 0ms no-op
         // and the tick() loop drops straight into real-progress tracking.
@@ -502,7 +548,25 @@ export function BootSplash({
                 const loadElapsed = el - effectivePrimeMs;
                 const t = Math.min(1, loadElapsed / LOAD_DURATION_MS);
                 const pacedE = 1 - Math.pow(1 - t, 3);
-                const realCeiling = targetPercentRef.current / 100;
+                // Safety net: if NO real BOOT_PROGRESS has arrived at all
+                // for a while (well past PRIME — a healthy connection
+                // reports its first stage within milliseconds), the
+                // ceiling is left fully open rather than pinning e at 0
+                // forever. A hard ceiling on a value that's still its
+                // untouched initial default isn't "a genuinely slow boot",
+                // it's missing data — a real, if rare, failure mode (e.g.
+                // a stale connection surviving a Vite HMR reload in dev)
+                // that must never strand the operator on a frozen wheel.
+                // The stall indicator (15s) still separately warns if the
+                // daemon connection itself is actually the problem.
+                let realCeiling: number;
+                if (hasReceivedFirstProgressRef.current) {
+                    realCeiling = targetPercentRef.current / 100;
+                } else if (el < NO_PROGRESS_FALLBACK_MS) {
+                    realCeiling = 0; // still within the normal "waiting for the first event" window
+                } else {
+                    realCeiling = 1; // safety net — no data for a while, don't strand at 0
+                }
                 e = Math.min(pacedE, realCeiling);
                 displayedPercentRef.current = e * 100; // kept in sync for any other reader, not used to derive e itself
             }
@@ -519,7 +583,17 @@ export function BootSplash({
             // daemon reports ready — which for an already-running daemon
             // arrives near-instantly via the snapshot-on-connect behavior.
             const effectiveMinMs = skipMinimum ? 0 : MIN_MS;
-            if (!readyFiredRef.current && stageRef.current === 'ready' && now - mountedAt >= effectiveMinMs) {
+            // Same safety net as the visual ceiling above, applied to the
+            // actual navigation gate too: if BOOT_PROGRESS never arrives
+            // at all, `stageRef.current` would stay null forever and this
+            // gate would never open even once the (uncapped, per the
+            // ceiling fallback) wheel visually finishes — a genuinely
+            // worse outcome than a frozen wheel, since the operator would
+            // see a "complete" animation that just never hands off. Treat
+            // a prolonged total absence of data as effectively ready.
+            const noRealDataAtAll = !hasReceivedFirstProgressRef.current && now - mountedAt >= NO_PROGRESS_FALLBACK_MS;
+            const effectivelyReady = stageRef.current === 'ready' || noRealDataAtAll;
+            if (!readyFiredRef.current && effectivelyReady && now - mountedAt >= effectiveMinMs) {
                 readyFiredRef.current = true;
                 markSplashShownThisSession();
                 onReadyRef.current?.();
