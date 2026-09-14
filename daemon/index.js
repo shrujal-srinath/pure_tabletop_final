@@ -173,10 +173,17 @@ function dispatch(action) {
     }
 
     if (action.type === ACTIONS.END_GAME) {
+        // wire-contract.js has defined GAME_ENDED/GameEndedPayload since
+        // Task 1 but nothing ever emitted it — added here (task 6e) so
+        // Post-Game has something concrete to trigger on rather than
+        // inferring end-of-game from gameActive flipping false in the
+        // regular STATE_UPDATE stream.
+        const finalCode = currentGameCode;
         if (cloudSync) { cloudSync.disconnect(); cloudSync = null; }
         journal.clear();
         writeGameCodeBreadcrumb(null);
         currentGameCode = null;
+        io.emit(LAN_EVENTS.GAME_ENDED, { finalCode });
     }
 
     return newState;

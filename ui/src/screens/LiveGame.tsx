@@ -51,6 +51,8 @@ import { ACTIONS, isBonus, isFouledOut } from '../../../shared/state-engine.js';
 import type { DaemonState, Player, ScorePendingPayload, TouchLockStatusPayload, Team } from '../lib/daemonTypes';
 import { ScoreDisplay } from '../components/ScoreDisplay';
 import { ClockDisplay } from '../components/ClockDisplay';
+import { Overlay } from '../components/Overlay';
+import { Settings } from './Settings';
 
 const ATTRIBUTION_TIMEOUT_MS = 8000;
 
@@ -73,6 +75,7 @@ export function LiveGame() {
     const [touchUnlocked, setTouchUnlocked] = useState(false);
     const [pending, setPending] = useState<ScorePendingPayload | null>(null);
     const [foulPickerTeam, setFoulPickerTeam] = useState<'A' | 'B' | null>(null);
+    const [showSettings, setShowSettings] = useState(false);
 
     useEffect(() => {
         let dismissTimer: number | null = null;
@@ -125,9 +128,18 @@ export function LiveGame() {
 
             <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', padding: '0 24px 24px' }}>
                 <TeamControls team={teamA} onFoul={() => setFoulPickerTeam('A')} onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'A' })} />
-                <button onClick={() => sendAction(ACTIONS.UNDO)} style={undoButtonStyle} title="Single-level undo — reverts only the last ref action, no further history">
-                    ↺ UNDO LAST ACTION
-                </button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => sendAction(ACTIONS.UNDO)} style={undoButtonStyle} title="Single-level undo — reverts only the last ref action, no further history">
+                        ↺ UNDO LAST ACTION
+                    </button>
+                    {/* No extra gating needed here beyond this button existing at
+                        all — the touch-lock overlay below already sits above
+                        everything in z-order and blocks clicks while locked,
+                        exactly the same as it already does for FOUL/TIMEOUT/UNDO. */}
+                    <button onClick={() => setShowSettings(true)} style={undoButtonStyle}>
+                        ⚙ SETTINGS
+                    </button>
+                </div>
                 <TeamControls team={teamB} onFoul={() => setFoulPickerTeam('B')} onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'B' })} />
             </div>
 
@@ -150,6 +162,11 @@ export function LiveGame() {
             {pending && meta.gameMode === 'advanced' && (
                 <CourtTapFlow pending={pending} team={pending.team === 'A' ? teamA : teamB} onConfirm={confirmAttribution} />
             )}
+
+            {/* Opening/closing this has no side effects on its own — it only
+                ever sends anything to the daemon if the operator explicitly
+                confirms End Game inside it. */}
+            {showSettings && <Settings onClose={() => setShowSettings(false)} />}
 
             {/* Touch-lock guard — the ONLY gate. One overlay above every other
                 element in the tree, not a per-button disabled check, so a
@@ -309,14 +326,6 @@ function PlayerList({ players, onPick }: { players: Player[]; onPick: (playerId?
     );
 }
 
-function Overlay({ children }: { children: React.ReactNode }) {
-    return (
-        <div style={overlayBackdropStyle}>
-            <div style={modalStyle}>{children}</div>
-        </div>
-    );
-}
-
 // ── Styles ────────────────────────────────────────────────────────────
 
 const buttonStyle: CSSProperties = {
@@ -332,24 +341,6 @@ const undoButtonStyle: CSSProperties = {
     ...buttonStyle,
     alignSelf: 'center',
     opacity: 0.8,
-};
-
-const overlayBackdropStyle: CSSProperties = {
-    position: 'fixed',
-    inset: 0,
-    zIndex: 5000,
-    background: 'rgba(0,0,0,0.75)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-};
-
-const modalStyle: CSSProperties = {
-    background: '#161616',
-    border: '1px solid #444',
-    borderRadius: 10,
-    padding: 24,
-    textAlign: 'center',
 };
 
 const modalHeadingStyle: CSSProperties = { marginTop: 0 };
