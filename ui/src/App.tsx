@@ -78,8 +78,15 @@ function App() {
             setConnected(false);
             console.log('[ui] disconnected from daemon');
         }
-        function onStateUpdate(s: DaemonState) {
-            console.log('[ui] state_update:', s);
+        function onStateUpdate(payload: Omit<DaemonState, '_previousState'>) {
+            console.log('[ui] state_update:', payload);
+            // daemon/index.js's real wire payload no longer includes
+            // `_previousState` at all (see daemonTypes.ts's own comment) —
+            // patched back to `null` right here, the one place raw daemon
+            // data enters this app's type system, so every other consumer
+            // of DaemonState downstream can keep treating the field as
+            // always-present rather than each needing its own `?? null`.
+            const s: DaemonState = { ...payload, _previousState: null };
             latestStateRef.current = s;
             setState(s);
         }

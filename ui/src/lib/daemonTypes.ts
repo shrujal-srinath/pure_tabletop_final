@@ -56,13 +56,18 @@ export interface DaemonState {
     meta: GameMeta;
     pendingAttribution: PendingAttribution | null;
     lastError: string | null;
-    // Present on the real wire payload today — daemon/index.js broadcasts
-    // its internal state object as-is and never strips this before
-    // io.emit(). It's an internal single-level undo snapshot, not something
-    // the UI should ever read; typed here only so this interface matches
-    // what's actually sent, not what "should" be sent. See LiveGame.tsx's
-    // top comment for the flagged daemon-side inefficiency this implies
-    // (a full nested snapshot re-sent on every broadcast, including ticks).
+    // state-engine.js's own State typedef declares this as required (the
+    // reducer's real internal state always carries it — needed for UNDO
+    // to work at all), and shared state-engine.js functions like isBonus/
+    // isFouledOut are typed against State, so this interface keeps it
+    // required too for structural compatibility with those. In reality it
+    // no longer arrives over the wire at all (daemon/index.js strips it
+    // from every state_update broadcast — flagged in Task 6b, closed as a
+    // follow-up: roughly doubled payload size for no reason the UI ever
+    // needed) — App.tsx's onStateUpdate is the one place that patches an
+    // incoming payload back to `_previousState: null` so every other
+    // consumer of DaemonState can keep treating it as always-present,
+    // never `undefined`.
     _previousState: DaemonState | null;
 }
 

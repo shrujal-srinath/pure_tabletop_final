@@ -8,14 +8,13 @@
 //
 // Design notes worth keeping in mind when touching this file:
 //
-// - FLAGGED, NOT FIXED HERE (daemon-side, out of this task's scope):
-//   daemon/index.js's dispatch() broadcasts its internal state object as-is
-//   (`io.emit(STATE_UPDATE, currentState)`), which still carries
-//   `_previousState` — a full nested undo snapshot — on every single
-//   broadcast, including every 100ms CLOCK_TICK while the clock runs. That
-//   roughly doubles payload size for no reason the UI needs (see
-//   daemonTypes.ts). This screen just ignores the field; the actual fix
-//   (strip it before broadcasting) belongs in a Task 6a follow-up.
+// - Payload-bloat cleanup closed: daemon/index.js's broadcasts used to
+//   carry state-engine.js's internal `_previousState` UNDO snapshot on
+//   every single state_update, including every 100ms CLOCK_TICK while the
+//   clock runs — roughly doubling payload size for no reason this screen
+//   (or any client) ever needed. Flagged here originally; fixed via a
+//   toPublicState() helper at every daemon-side broadcast site. See
+//   daemonTypes.ts's own comment for the full story.
 //
 // - Score always renders straight from `state.teamA/teamB.score` with no
 //   gating — the attribution popup and court-tap flow are overlays on TOP

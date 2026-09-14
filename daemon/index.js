@@ -89,6 +89,19 @@ function generatePlaceholderGameCode() {
     return code;
 }
 
+// Flagged back in Task 6b, closed here: state-engine.js's `_previousState`
+// (its own internal single-level UNDO snapshot) was being broadcast as
+// part of every single state_update, roughly doubling payload size for
+// no reason any client needs — LiveGame.tsx never reads it, UNDO is
+// purely a daemon-internal, reduce()-only mechanism. `currentState`
+// itself must keep carrying it (the reducer needs it for UNDO to work at
+// all) — only the OUTGOING wire payload is trimmed, via this helper at
+// every state_update send site, never by mutating `currentState`.
+function toPublicState(state) {
+    const { _previousState, ...publicState } = state;
+    return publicState;
+}
+
 function readGameCodeBreadcrumb() {
     if (!fs.existsSync(GAME_CODE_FILE)) return null;
     const code = fs.readFileSync(GAME_CODE_FILE, 'utf8').trim();
@@ -269,7 +282,7 @@ async function acceptRemoteGame(gameCode) {
         cloudSync.connect();
         currentState = { ...state, meta: { ...state.meta, gameCode } };
 
-        io.emit(LAN_EVENTS.STATE_UPDATE, currentState);
+        io.emit(LAN_EVENTS.STATE_UPDATE, toPublicState(currentState));
         console.log(`[box-identity] accepted remote game ${gameCode} — ${currentState.teamA.name} ${currentState.teamA.score}-${currentState.teamB.score} ${currentState.teamB.name}, period ${currentState.clock.period}`);
         if (currentState.meta.gameActive && BOX_IDENTITY_ENABLED) markBoxLive(supabaseClient, boxCode).catch((err) => console.error('[box-identity] markBoxLive failed:', err.message));
     } catch (err) {
@@ -308,7 +321,7 @@ function dispatch(action) {
     if (cloudSync) cloudSync.onStateChange(newState, action);
     currentState = newState;
 
-    io.emit(LAN_EVENTS.STATE_UPDATE, currentState);
+    io.emit(LAN_EVENTS.STATE_UPDATE, toPublicState(currentState));
 
     // Broadcast score_pending exactly when THIS dispatch's own SCORE action
     // needed attribution — gated on action.type, not on a null->non-null
@@ -374,7 +387,7 @@ const ticker = createTicker({
 // ── Socket.io (the touchscreen UI) ───────────────────────────────────
 io.on('connection', (socket) => {
     console.log(`[daemon] UI connected: ${socket.id}`);
-    socket.emit(LAN_EVENTS.STATE_UPDATE, currentState);
+    socket.emit(LAN_EVENTS.STATE_UPDATE, toPublicState(currentState));
     socket.emit(LAN_EVENTS.TOUCH_LOCK_STATUS, { unlocked: touchUnlocked });
     // Same "hand a late joiner the current snapshot, not just future
     // broadcasts" pattern as the two lines above — a tab opened after boot
