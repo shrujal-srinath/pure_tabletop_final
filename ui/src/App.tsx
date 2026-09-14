@@ -3,19 +3,23 @@ import { socket, LAN_EVENTS } from './lib/socket';
 import { BootSplash } from './screens/BootSplash';
 import { LiveGame } from './screens/LiveGame';
 import { Spectator } from './screens/Spectator';
+import { Setup } from './screens/Setup';
 import type { DaemonState } from './lib/daemonTypes';
 
-// Minimal routing, NOT the real 8-screen router (Dashboard/Match Setup/
-// Roster Setup/Settings/Post-Game are separate later tasks) — just enough
-// to actually reach LiveGame/Spectator, since a screen with no way to
-// render is a screen that can't be tested against the real daemon.
+// Minimal routing, NOT the real 8-screen router (Dashboard/Settings/
+// Post-Game are still separate later tasks) — just enough to actually
+// reach each screen, since a screen with no way to render is a screen
+// that can't be tested against the real daemon.
 //
-// Spectator is reached via a plain URL path (`/spectator`) rather than any
-// in-app navigation — it's meant to be the second physical display's own
-// browser window/tab pointed at a different URL, not something reached by
-// tapping through the referee's screen. Checked ahead of the
-// gameActive/BootSplash branch since the spectator display has no reason
-// to ever show the boot animation or wait on the primary screen's state.
+// Order matters:
+//   1. /spectator always wins — the second display has no reason to ever
+//      show the boot animation or the setup/live flow.
+//   2. An active game always wins over being parked on /setup — once
+//      setup_game succeeds (from either MatchSetup or RosterSetup),
+//      meta.gameActive flips true and this should move to LiveGame even
+//      if the browser is still sitting on the /setup URL.
+//   3. /setup reaches the Match Setup -> Roster Setup flow.
+//   4. Otherwise, BootSplash.
 function App() {
     const [state, setState] = useState<DaemonState | null>(null);
 
@@ -52,6 +56,9 @@ function App() {
     }
     if (state?.meta.gameActive) {
         return <LiveGame />;
+    }
+    if (window.location.pathname === '/setup') {
+        return <Setup />;
     }
     return <BootSplash />;
 }

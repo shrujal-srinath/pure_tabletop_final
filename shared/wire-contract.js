@@ -257,6 +257,9 @@ export const LAN_EVENTS = {
 
 /**
  * UI → daemon, on `setup_game`. Operator-submitted match configuration.
+ * `roster` was always accepted by state-engine.js's SETUP_GAME action
+ * (Task 2) but missing from this typedef until task 6d — added here
+ * additively, Contract A untouched.
  * @typedef {Object} SetupGamePayload
  * @property {string} teamAName
  * @property {string} teamBName
@@ -267,6 +270,9 @@ export const LAN_EVENTS = {
  * @property {number} periods
  * @property {'quick'|'stats'|'advanced'} gameMode
  * @property {string} [existingGameCode] Resume path — set to recover a game the daemon already created.
+ * @property {Object} [roster] stats/advanced mode only — omitted entirely for quick mode.
+ * @property {Array<{id:string,name:string,number:string}>} [roster.teamA] `number` is a string (jersey numbers are display text, e.g. "00") — matches state-engine.js's real Player/normalizeRoster types exactly; the task text that originally asked for this field said `number:number`, which doesn't match the actual reducer and wasn't followed. Only id/name/number are submitted; fouls/fouledOut are initialized by the reducer itself.
+ * @property {Array<{id:string,name:string,number:string}>} [roster.teamB]
  */
 
 /**
