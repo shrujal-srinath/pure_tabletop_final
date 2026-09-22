@@ -44,7 +44,10 @@ export interface GameMeta {
 
 export interface PendingAttribution {
     team: 'A' | 'B';
-    points: 1 | 2 | 3;
+    /** Null ONLY for a miss — its location decides the attempt value instead. */
+    points: 1 | 2 | 3 | null;
+    /** False for a SHOT_MISS. Required here to stay structurally compatible with state-engine.js's own State typedef. */
+    made: boolean;
     ts: number | null;
 }
 
@@ -73,7 +76,17 @@ export interface DaemonState {
 
 export interface ScorePendingPayload {
     team: 'A' | 'B';
-    points: 1 | 2 | 3;
+    /**
+     * Null ONLY when `made` is false: nothing scored, so no physical button
+     * reported a value and the shot's location decides whether it was a 2pt or
+     * 3pt attempt.
+     */
+    points: 1 | 2 | 3 | null;
+    /**
+     * False for a miss. Optional because payloads sent before misses existed
+     * omit it — read as `made !== false` so an older sender still means a make.
+     */
+    made?: boolean;
     ts: number;
 }
 

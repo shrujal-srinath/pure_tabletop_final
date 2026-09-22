@@ -11,3 +11,7 @@ Thumbs.db
 # runtime journal/snapshot data (daemon/journal.js) — not source
 /data/
 /data-test*/
+
+# screenshots written by the ui/scripts/verify-*.mjs runs — generated proof,
+# regenerated on every run, not source
+/ui/*-shots/

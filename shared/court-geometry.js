@@ -626,6 +626,53 @@ export function mirrorQuickSpot(spot, half) {
     return half === 'right' ? { lx: LS_W - spot.lx, ly: spot.ly } : { lx: spot.lx, ly: spot.ly };
 }
 
+/** How close a tap must be to a quick spot to snap to it, in court units (≈1 m). */
+export const QUICK_SPOT_SNAP_RADIUS = 6.5;
+
+/**
+ * Every quick spot at both ends, in landscape coords — what a capture surface
+ * draws and snaps to.
+ * @returns {Array<QuickSpot & {half: 'left'|'right', key: string}>}
+ */
+export function allQuickSpots() {
+    /** @type {Array<QuickSpot & {half: 'left'|'right', key: string}>} */
+    const out = [];
+    for (const half of /** @type {const} */ (['left', 'right'])) {
+        for (const spot of QUICK_SPOTS) {
+            const { lx, ly } = mirrorQuickSpot(spot, half);
+            out.push({ ...spot, lx, ly, half, key: `${spot.id}-${half}` });
+        }
+    }
+    return out;
+}
+
+/**
+ * Nearest quick spot within the snap radius, or null.
+ *
+ * Quick spots earn their snap the same way the rim does: their coordinates are
+ * AUTHORITATIVE (a corner 3 really is taken from that spot) while a finger
+ * position near them is only an approximation, so snapping makes the record
+ * more accurate rather than less. That is the opposite of snapping to a hex
+ * grid, which replaces a real position with an arbitrary one.
+ *
+ * @param {number} lx
+ * @param {number} ly
+ * @param {number} [radius]
+ * @returns {(QuickSpot & {half: 'left'|'right', key: string})|null}
+ */
+export function snapToQuickSpot(lx, ly, radius = QUICK_SPOT_SNAP_RADIUS) {
+    let best = null;
+    let bestD = radius;
+    for (const spot of allQuickSpots()) {
+        const d = Math.hypot(lx - spot.lx, ly - spot.ly);
+        if (d <= bestD) {
+            bestD = d;
+            best = spot;
+        }
+    }
+    return best;
+}
+
 // ── The capture entry point ────────────────────────────────────────────────
 
 /**

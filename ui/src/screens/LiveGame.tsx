@@ -30,27 +30,30 @@
 //   pendingAttribution when a new one is needed — a pre-existing reducer
 //   behavior, not something this screen introduces or works around).
 //   Dismissing the popup after 8s is therefore a purely local UI concern.
-// - Court-tap "team confirmation": the team credited for the score is
-//   ALREADY fixed the instant the physical button was pressed
-//   (pendingAttribution.team) — ATTRIBUTE_SHOT only ever takes a playerId,
-//   and cloud-sync.js persists the shot under the ORIGINAL scoring team
-//   regardless of what the UI sends. So the confirm-before-commit step here
-//   is scoped to what's actually still undecided at tap time: which
-//   basket/orientation the tap represents (for x/y storage), and which
-//   player on the (fixed) scoring team gets credit. It deliberately does
-//   NOT let the operator re-pick a different team's roster — that would
-//   silently create a team/player mismatch in shot_events, a worse bug
-//   than the one this task is fixing. Full courtZones.ts-accurate zone/arc
-//   geometry isn't ported into box-pi yet; the tap surface here is a
-//   placeholder good enough to prove the confirm-before-commit flow.
+// - Shot location (advanced mode) is ShotCapture's job, not this screen's.
+//   The placeholder green-rectangle "near/far basket" tap surface that used
+//   to live here is gone: box-pi now carries the ecosystem's real court law
+//   in shared/court-geometry.js (a verified mirror of the website's
+//   courtZones.ts), so the capture surface is a true FIBA full court and
+//   every coordinate decision goes through resolveTap(). See ShotCapture.tsx
+//   for why it works the way it does.
+// - The team credited for a score is ALREADY fixed the instant the physical
+//   button was pressed (pendingAttribution.team), and cloud-sync.js persists
+//   the shot under that team regardless of what this screen sends. The
+//   capture flow therefore never offers the other team's roster — that would
+//   silently create a team/player mismatch in shot_events.
+// - MISS has no physical button (the Pico has no such key), so it is
+//   initiated here. Unlike a score it opens the capture prompt locally, since
+//   the daemon only emits SCORE_PENDING for an actual SCORE — see recordMiss.
 
-import { useEffect, useState, type CSSProperties, type MouseEvent } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { socket, LAN_EVENTS } from '../lib/socket';
 import { ACTIONS, isBonus, isFouledOut } from '../../../shared/state-engine.js';
 import type { DaemonState, Player, ScorePendingPayload, TouchLockStatusPayload, Team } from '../lib/daemonTypes';
 import { ScoreDisplay } from '../components/ScoreDisplay';
 import { ClockDisplay } from '../components/ClockDisplay';
 import { Overlay } from '../components/Overlay';
+import { ShotCapture } from '../components/ShotCapture';
 import { Settings } from './Settings';
 
 const ATTRIBUTION_TIMEOUT_MS = 8000;
@@ -123,6 +126,18 @@ export function LiveGame({ initialState = null }: { initialState?: DaemonState |
         setPending(null);
     }
 
+    // A miss produces no score, so the daemon has no reason to emit
+    // SCORE_PENDING for it the way a physical score button does — that event
+    // is gated on ACTIONS.SCORE. The capture prompt is therefore opened
+    // locally, and the daemon's own SHOT_MISS keeps the reducer's
+    // pendingAttribution in step so the follow-up ATTRIBUTE_SHOT resolves
+    // against a miss (made:false) rather than being rejected as unsolicited.
+    function recordMiss(team: 'A' | 'B') {
+        const ts = Date.now();
+        sendAction(ACTIONS.SHOT_MISS, { team, ts });
+        setPending({ team, points: null, made: false, ts });
+    }
+
     if (!state) {
         return <div style={{ padding: 24, color: '#fff', background: '#0a0a0a', minHeight: '100vh' }}>LIVE GAME — waiting for state…</div>;
     }
@@ -138,7 +153,13 @@ export function LiveGame({ initialState = null }: { initialState?: DaemonState |
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'space-around', alignItems: 'center', padding: '0 24px 24px' }}>
-                <TeamControls team={teamA} onFoul={() => setFoulPickerTeam('A')} onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'A' })} />
+                <TeamControls
+                    team={teamA}
+                    canMiss={meta.gameMode !== 'quick'}
+                    onFoul={() => setFoulPickerTeam('A')}
+                    onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'A' })}
+                    onMiss={() => recordMiss('A')}
+                />
                 <div style={{ display: 'flex', gap: 8 }}>
                     <button onClick={() => sendAction(ACTIONS.UNDO)} style={undoButtonStyle} title="Single-level undo — reverts only the last ref action, no further history">
                         ↺ UNDO LAST ACTION
@@ -151,7 +172,13 @@ export function LiveGame({ initialState = null }: { initialState?: DaemonState |
                         ⚙ SETTINGS
                     </button>
                 </div>
-                <TeamControls team={teamB} onFoul={() => setFoulPickerTeam('B')} onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'B' })} />
+                <TeamControls
+                    team={teamB}
+                    canMiss={meta.gameMode !== 'quick'}
+                    onFoul={() => setFoulPickerTeam('B')}
+                    onTimeout={() => sendAction(ACTIONS.TIMEOUT, { team: 'B' })}
+                    onMiss={() => recordMiss('B')}
+                />
             </div>
 
             {foulPickerTeam && (
@@ -171,7 +198,28 @@ export function LiveGame({ initialState = null }: { initialState?: DaemonState |
                 <AttributionPopup pending={pending} team={pending.team === 'A' ? teamA : teamB} onPick={(id) => confirmAttribution(id)} />
             )}
             {pending && meta.gameMode === 'advanced' && (
-                <CourtTapFlow pending={pending} team={pending.team === 'A' ? teamA : teamB} onConfirm={confirmAttribution} />
+                <ShotCapture
+                    // Remounted per pending shot so a second score arriving
+                    // mid-flow starts a clean capture rather than inheriting
+                    // the previous one's half-finished location.
+                    key={pending.ts}
+                    pending={pending}
+                    team={pending.team === 'A' ? teamA : teamB}
+                    onCommit={(shot) => {
+                        sendAction(ACTIONS.ATTRIBUTE_SHOT, {
+                            playerId: shot.playerId, x: shot.x, y: shot.y, zone: shot.zone, points: shot.points,
+                        });
+                        setPending(null);
+                    }}
+                    // The shot is never discarded just because its location
+                    // wasn't captured — it lands as `unlocated`, which is a
+                    // real, reportable value, not a dropped row.
+                    onSkipLocation={() => {
+                        sendAction(ACTIONS.ATTRIBUTE_SHOT, { zone: 'unlocated' });
+                        setPending(null);
+                    }}
+                    onCancel={() => setPending(null)}
+                />
             )}
 
             {/* Opening/closing this has no side effects on its own — it only
@@ -196,13 +244,28 @@ export function LiveGame({ initialState = null }: { initialState?: DaemonState |
 
 // ── Presentational pieces ────────────────────────────────────────────
 
-function TeamControls({ team, onFoul, onTimeout }: { team: Team; onFoul: () => void; onTimeout: () => void }) {
+function TeamControls({ team, canMiss, onFoul, onTimeout, onMiss }: {
+    team: Team;
+    canMiss: boolean;
+    onFoul: () => void;
+    onTimeout: () => void;
+    onMiss: () => void;
+}) {
     const timeoutsLeft = team.timeouts > 0;
     return (
         <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={onFoul} style={buttonStyle}>
                 FOUL
             </button>
+            {/* Misses have no physical button — there is nothing on the Pico
+                for "a shot that didn't go in" — so this is the only way FG%
+                and shot quality become computable at all. Hidden in quick
+                mode, which records no play-by-play for it to land in. */}
+            {canMiss && (
+                <button data-testid={`miss-${team.name}`} onClick={onMiss} style={missButtonStyle}>
+                    MISS
+                </button>
+            )}
             <button
                 onClick={onTimeout}
                 disabled={!timeoutsLeft}
@@ -253,67 +316,6 @@ function AttributionPopup({ pending, team, onPick }: { pending: ScorePendingPayl
     );
 }
 
-function CourtTapFlow({
-    pending, team, onConfirm,
-}: {
-    pending: ScorePendingPayload;
-    team: Team;
-    onConfirm: (playerId: string | undefined, extra: { x: number; y: number; zone: string }) => void;
-}) {
-    const secondsLeft = useCountdown(pending.ts, ATTRIBUTION_TIMEOUT_MS);
-    const [tapFrac, setTapFrac] = useState<{ x: number; y: number } | null>(null);
-    const [mirrored, setMirrored] = useState(false);
-
-    function handleCourtClick(e: MouseEvent<HTMLDivElement>) {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const xFrac = (e.clientX - rect.left) / rect.width;
-        const yFrac = (e.clientY - rect.top) / rect.height;
-        setTapFrac({ x: xFrac, y: yFrac });
-        // Pre-set guess from tap side — operator can flip it below before
-        // anything commits. This is THE fix for the old build's bug: no
-        // guess ever reaches the daemon without an explicit confirm step.
-        setMirrored(xFrac >= 0.5);
-    }
-
-    if (!tapFrac) {
-        return (
-            <Overlay>
-                <h2 style={modalHeadingStyle}>
-                    {team.name} +{pending.points} — tap the shot location
-                </h2>
-                <div style={countdownStyle}>closing in {secondsLeft}s — unattributed if ignored</div>
-                <div data-testid="court-tap-surface" onClick={handleCourtClick} style={courtSurfaceStyle}>
-                    <div style={{ ...halfLabelStyle, left: 0 }}>NEAR BASKET</div>
-                    <div style={{ ...halfLabelStyle, right: 0 }}>FAR BASKET</div>
-                </div>
-                <p style={{ fontSize: 11, opacity: 0.5, maxWidth: 320 }}>
-                    Placeholder court surface — real zone/arc geometry is separate, later work. This proves the
-                    confirm-before-commit flow.
-                </p>
-            </Overlay>
-        );
-    }
-
-    const x = Math.round((mirrored ? 1 - tapFrac.x : tapFrac.x) * 100);
-    const y = Math.round(tapFrac.y * 94);
-
-    return (
-        <Overlay>
-            <h2 style={modalHeadingStyle}>Confirm shot side</h2>
-            <p style={{ fontSize: 13, maxWidth: 320 }}>
-                Tap implies the <strong>{mirrored ? 'far' : 'near'}</strong> basket — flip if that's wrong.{' '}
-                {team.name} is already credited with the score; nothing else is sent until you pick a player.
-            </p>
-            <button data-testid="flip-side-button" onClick={() => setMirrored((m) => !m)} style={{ ...buttonStyle, marginBottom: 12 }}>
-                Flip side (currently: {mirrored ? 'far' : 'near'} basket)
-            </button>
-            <PlayerList players={team.players} onPick={(id) => id && onConfirm(id, { x, y, zone: 'unlocated' })} />
-            <button onClick={() => setTapFrac(null)} style={{ ...buttonStyle, marginTop: 8, opacity: 0.7 }}>
-                Retap
-            </button>
-        </Overlay>
-    );
-}
 
 function PlayerList({ players, onPick }: { players: Player[]; onPick: (playerId?: string) => void }) {
     return (
@@ -348,6 +350,12 @@ const buttonStyle: CSSProperties = {
     borderRadius: 6,
 };
 
+const missButtonStyle: CSSProperties = {
+    ...buttonStyle,
+    border: '1px solid #7a1a1a',
+    background: '#2a1010',
+};
+
 const undoButtonStyle: CSSProperties = {
     ...buttonStyle,
     alignSelf: 'center',
@@ -358,22 +366,3 @@ const modalHeadingStyle: CSSProperties = { marginTop: 0 };
 
 const countdownStyle: CSSProperties = { fontSize: 13, opacity: 0.7, marginBottom: 14, fontFamily: 'monospace' };
 
-const courtSurfaceStyle: CSSProperties = {
-    width: 320,
-    height: 280,
-    background: '#173a17',
-    border: '2px solid #fff',
-    margin: '4px auto 12px',
-    cursor: 'crosshair',
-    position: 'relative',
-};
-
-const halfLabelStyle: CSSProperties = {
-    position: 'absolute',
-    top: '50%',
-    transform: 'translateY(-50%)',
-    width: '50%',
-    textAlign: 'center',
-    opacity: 0.4,
-    fontSize: 12,
-};
