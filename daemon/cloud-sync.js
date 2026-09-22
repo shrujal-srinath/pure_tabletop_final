@@ -55,7 +55,7 @@
 
 import { CLOUD_EVENTS } from '../shared/wire-contract.js';
 import { ACTIONS } from '../shared/state-engine.js';
-import { freeThrowLocation } from '../shared/court-geometry.js';
+import { freeThrowLocation, zonePointValue } from '../shared/court-geometry.js';
 
 const CLOCK_BROADCAST_THROTTLE_MS = 1000;
 const RETRY_INTERVAL_MS = 15000;
@@ -257,7 +257,7 @@ export function createCloudSync({ supabaseClient, gameCode, retryIntervalMs = RE
         if (error) throw new Error(error.message);
     }
 
-    function writeShotEvent({ team, points, playerId, x = null, y = null, zone = 'unlocated', attributes = [] }, newState) {
+    function writeShotEvent({ team, points, playerId, x = null, y = null, zone = 'unlocated', attributes = [], made = true }, newState) {
         // Generated once per logical write, here — NOT inside the retry
         // closure — so every retry of THIS write reuses the same id and the
         // guard above actually recognizes it as "already tried this one",
@@ -278,7 +278,7 @@ export function createCloudSync({ supabaseClient, gameCode, retryIntervalMs = RE
             player_id: playerId ?? null,
             team_side: team,
             x: location.x, y: location.y, zone: location.zone,
-            made: true, // state-engine only models made shots today — no miss action exists yet, a known continued gap
+            made,
             points,
             shot_type: isFreeThrow ? 'free_throw' : 'field_goal',
             period: newState.clock.period,
@@ -403,11 +403,29 @@ export function createCloudSync({ supabaseClient, gameCode, retryIntervalMs = RE
                     }, newState);
                 }
                 break;
+            case ACTIONS.SHOT_MISS:
+                // Nothing is written here. A miss carries no points of its own
+                // (its location decides the attempt value), so there is nothing
+                // to persist until ATTRIBUTE_SHOT arrives with the tap. A
+                // rejected SHOT_MISS (quick mode) leaves lastError set and
+                // never reaches that follow-up at all.
+                break;
             case ACTIONS.ATTRIBUTE_SHOT:
                 if (newState.meta.gameMode !== 'quick' && lastPendingAttribution) {
+                    const made = lastPendingAttribution.made !== false;
+                    const zone = action.payload.zone ?? 'unlocated';
+                    // A make already knows its value — the physical button
+                    // reported it. A miss doesn't: resolve the attempt value
+                    // from where the shot was taken, preferring the value the
+                    // capture UI resolved (it saw the exact tap) and falling
+                    // back to the zone's own value if it sent none. An
+                    // unlocated miss can only be assumed a 2.
+                    const points = lastPendingAttribution.points
+                        ?? action.payload.points
+                        ?? zonePointValue(zone);
                     writeShotEvent({
-                        team: lastPendingAttribution.team, points: lastPendingAttribution.points, playerId: action.payload.playerId,
-                        x: action.payload.x ?? null, y: action.payload.y ?? null, zone: action.payload.zone ?? 'unlocated',
+                        team: lastPendingAttribution.team, points, made, playerId: action.payload.playerId,
+                        x: action.payload.x ?? null, y: action.payload.y ?? null, zone,
                         attributes: action.payload.attributes ?? [],
                     }, newState);
                 }

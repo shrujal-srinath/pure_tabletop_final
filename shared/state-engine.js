@@ -67,8 +67,9 @@
 /**
  * @typedef {Object} PendingAttribution
  * @property {'A'|'B'} team
- * @property {1|2|3} points
- * @property {number|null} ts Caller-supplied (e.g. Date.now()) when the SCORE action is dispatched — this module never reads the clock itself.
+ * @property {1|2|3|null} points Null ONLY for a miss: nothing scored, so no button reported a value and the shot's location decides whether it was a 2pt or 3pt attempt. Always set for a make.
+ * @property {boolean} made False for a SHOT_MISS, true for a SCORE. Decides `shot_events.made`, which is what makes FG% and every shot-quality number possible — a makes-only dataset inflates all of them.
+ * @property {number|null} ts Caller-supplied (e.g. Date.now()) when the action is dispatched — this module never reads the clock itself.
  */
 
 /**
@@ -92,6 +93,7 @@
 export const ACTIONS = {
     SETUP_GAME: 'SETUP_GAME',
     SCORE: 'SCORE',
+    SHOT_MISS: 'SHOT_MISS',
     ATTRIBUTE_SHOT: 'ATTRIBUTE_SHOT',
     FOUL: 'FOUL',
     TIMEOUT: 'TIMEOUT',
@@ -262,8 +264,33 @@ export function reduce(state, action) {
                 ...state,
                 [teamKey]: { ...state[teamKey], score: state[teamKey].score + payload.points },
                 pendingAttribution: needsAttribution
-                    ? { team: payload.team, points: payload.points, ts: payload.ts ?? null }
+                    ? { team: payload.team, points: payload.points, made: true, ts: payload.ts ?? null }
                     : state.pendingAttribution,
+                lastError: null,
+                _previousState: snapshotForUndo(state),
+            };
+        }
+
+        case ACTIONS.SHOT_MISS: {
+            // A miss changes NOTHING about the game: no score, no fouls, no
+            // clock. Its entire purpose is to open a shot-attribution prompt
+            // so a `shot_events` row with made:false gets written — which is
+            // what makes FG% and shot-quality analytics mean anything. A
+            // makes-only dataset reports every player as a 100% shooter.
+            //
+            // Quick mode has no play-by-play at all, so there is nothing for
+            // a miss to produce there — rejected rather than silently swallowed
+            // so a mis-wired UI surfaces instead of dropping data.
+            if (state.meta.gameMode === 'quick') {
+                return reject(state, 'Misses are not recorded in quick mode.');
+            }
+            // Unlike SCORE, `points` is deliberately absent: nothing was
+            // scored, so no button reported a value. The shot's LOCATION
+            // decides whether it was a 2pt or 3pt attempt, resolved when
+            // ATTRIBUTE_SHOT arrives with the tap.
+            return {
+                ...state,
+                pendingAttribution: { team: payload.team, points: null, made: false, ts: payload.ts ?? null },
                 lastError: null,
                 _previousState: snapshotForUndo(state),
             };

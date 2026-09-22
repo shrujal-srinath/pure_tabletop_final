@@ -217,9 +217,13 @@ export const LAN_EVENTS = {
  * own event rather than a field on StateUpdatePayload: it's a one-shot
  * instruction to show a popup, not persistent state, so the UI must not
  * re-trigger it just because a later state_update replays the same score.
+ * Also sent for a MISS (`made: false`), which is the same prompt with a
+ * different outcome — the UI shows its miss visual language rather than a
+ * second, near-identical flow.
  * @typedef {Object} ScorePendingPayload
  * @property {'A'|'B'} team
- * @property {1|2|3} points
+ * @property {1|2|3|null} points Null ONLY when `made` is false: nothing scored, so the shot's location decides whether it was a 2pt or 3pt attempt.
+ * @property {boolean} made False for a miss. Absent on payloads sent before misses existed — read it as `payload.made !== false` so an older sender still means "a make".
  * @property {number} ts
  */
 

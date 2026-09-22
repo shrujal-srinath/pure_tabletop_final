@@ -113,5 +113,59 @@ assert.equal(un.zone, 'unlocated', "a field goal with no captured location is 'u
 assert.equal(un.x, null);
 console.log("OK — 'unlocated' still means what it means; only free throws were reclassified.\n");
 
+// ── 5. A miss: no score change, a row with made:false ─────────────────────
+console.log('─── a MISS, located beyond the arc ───');
+const scoreBefore = { A: state.teamA.score, B: state.teamB.score };
+apply({ type: ACTIONS.SHOT_MISS, payload: { team: 'A' } });
+assert.equal(state.teamA.score, scoreBefore.A, 'a miss must not change the score');
+assert.equal(state.pendingAttribution.made, false, 'a miss opens an attribution prompt flagged as a miss');
+assert.equal(state.pendingAttribution.points, null, 'a miss has no points until its location is known');
+
+const missTap = resolveTap({ lx: 56, ly: 50 }); // no `points` — the location decides
+apply({ type: ACTIONS.ATTRIBUTE_SHOT, payload: {
+    playerId: 'p1', x: missTap.x, y: missTap.y, zone: missTap.zone, points: missTap.impliedPoints,
+} });
+await settle();
+
+const miss = shotEventsTable.at(-1);
+console.log('row:', JSON.stringify({ zone: miss.zone, made: miss.made, points: miss.points, x: miss.x, y: miss.y }));
+assert.equal(miss.made, false, 'the row must record that the shot missed');
+assert.equal(miss.points, 3, 'a miss beyond the arc is a 3-point ATTEMPT, resolved from its location');
+assert.equal(miss.zone, 'three_top_center');
+assert.equal(state.teamA.score, scoreBefore.A, 'and the score is still untouched after the attribution');
+console.log('OK — made:false with the attempt value derived from where the shot was taken.\n');
+
+console.log('─── a MISS inside the arc is a 2-point attempt ───');
+apply({ type: ACTIONS.SHOT_MISS, payload: { team: 'B' } });
+const missTap2 = resolveTap({ lx: 40, ly: 50 });
+apply({ type: ACTIONS.ATTRIBUTE_SHOT, payload: {
+    playerId: 'p1', x: missTap2.x, y: missTap2.y, zone: missTap2.zone, points: missTap2.impliedPoints,
+} });
+await settle();
+
+const miss2 = shotEventsTable.at(-1);
+console.log('row:', JSON.stringify({ zone: miss2.zone, made: miss2.made, points: miss2.points }));
+assert.equal(miss2.made, false);
+assert.equal(miss2.points, 2, 'the same flow yields a 2 when the tap is inside the arc');
+console.log('OK — the attempt value follows the location, with no second button.\n');
+
+console.log('─── makes still record made:true ───');
+apply({ type: ACTIONS.SCORE, payload: { team: 'A', points: 2, playerId: 'p1', zone: 'at_rim', x: 50, y: 10.5 } });
+await settle();
+const make = shotEventsTable.at(-1);
+assert.equal(make.made, true, 'a SCORE is still a make — the miss work must not have flipped the default');
+console.log('OK — made:true preserved for scores.\n');
+
+console.log('─── quick mode records no misses at all ───');
+let qs = createEmptyState();
+qs = reduce(qs, { type: ACTIONS.SETUP_GAME, payload: {
+    teamAName: 'A', teamAColor: '#fff', teamBName: 'B', teamBColor: '#000',
+    periodMinutes: 10, shotClockSeconds: 24, periods: 4, gameMode: 'quick',
+} });
+const qsAfter = reduce(qs, { type: ACTIONS.SHOT_MISS, payload: { team: 'A' } });
+assert.ok(qsAfter.lastError, 'quick mode rejects a miss rather than silently dropping it');
+assert.equal(qsAfter.pendingAttribution, null, 'and opens no prompt');
+console.log(`OK — rejected with: "${qsAfter.lastError}"\n`);
+
 console.log('ALL CHECKS PASSED');
 process.exit(0);
