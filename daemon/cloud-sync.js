@@ -55,6 +55,7 @@
 
 import { CLOUD_EVENTS } from '../shared/wire-contract.js';
 import { ACTIONS } from '../shared/state-engine.js';
+import { freeThrowLocation } from '../shared/court-geometry.js';
 
 const CLOCK_BROADCAST_THROTTLE_MS = 1000;
 const RETRY_INTERVAL_MS = 15000;
@@ -262,14 +263,24 @@ export function createCloudSync({ supabaseClient, gameCode, retryIntervalMs = RE
         // guard above actually recognizes it as "already tried this one",
         // rather than minting a fresh id (and defeating the guard) each retry.
         const clientEventId = crypto.randomUUID();
+        const isFreeThrow = points === 1;
+        // A free throw has no court location. The ecosystem's convention is
+        // zone 'free_throw' with x/y NULL — NOT 'unlocated', which means
+        // "a field goal whose location we failed to capture" and is a
+        // meaningfully different row to every consumer. The website writes
+        // it this way too (shotService normalizes FTs; migration 013
+        // back-filled the historical rows it had been faking as mid_top).
+        // Normalized here rather than at each call site so no caller can
+        // reintroduce a located free throw.
+        const location = isFreeThrow ? freeThrowLocation() : { x, y, zone };
         const row = {
             game_code: gameCode,
             player_id: playerId ?? null,
             team_side: team,
-            x, y, zone,
+            x: location.x, y: location.y, zone: location.zone,
             made: true, // state-engine only models made shots today — no miss action exists yet, a known continued gap
             points,
-            shot_type: points === 1 ? 'free_throw' : 'field_goal',
+            shot_type: isFreeThrow ? 'free_throw' : 'field_goal',
             period: newState.clock.period,
             game_clock_sec: Math.ceil(newState.clock.gameMs / 1000),
             shot_clock_sec: Math.ceil(newState.clock.shotMs / 1000),
